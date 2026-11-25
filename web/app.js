@@ -390,12 +390,15 @@ function configureEndedView(phase, statusText) {
     els.endedTitle.textContent = "Original admin session cannot be restored";
     els.endedReason.textContent =
       statusText ||
-      "Safari or your browser unloaded this tab in the background and cleared its temporary RAM. Because encryption keys are never saved to storage, the original admin session cannot be restored and open invites can no longer be admitted from this tab. Start a new room to continue.";
+      "The browser or operating system unloaded this tab in the background and cleared its temporary RAM. Because keys, history, and resume tokens are never saved to storage, the original admin session cannot be restored. Create a new room to continue.";
+    els.btnRestart.textContent = "Create a new room";
   } else {
-    els.endedBadge.textContent = "Room ended";
+    const isExpired = Boolean(statusText && statusText.toLowerCase().includes("expired"));
+    els.endedBadge.textContent = isExpired ? "Session expired" : "Room ended";
     els.endedBadge.className = "status-pill pill-danger";
-    els.endedTitle.textContent = "Chat room ended";
+    els.endedTitle.textContent = isExpired ? "Session expired" : "Chat room ended";
     els.endedReason.textContent = statusText || "This ephemeral room has ended.";
+    els.btnRestart.textContent = "Back to start";
   }
 }
 
@@ -852,6 +855,7 @@ function handleVisibilityHidden() {
   window.clearTimeout(sessionRetryTimer);
   sessionRetryTimer = null;
   sessionRetryCount = 0;
+  lastSessionCheckAtMs = 0;
   visibilityToken += 1;
   if (currentState.phase === "active" || currentState.phase === "reconnecting") {
     visibilityShieldLocked = true;
@@ -867,44 +871,74 @@ function handleVisibilityHidden() {
   sendWorker({ type: "ui_hidden" });
 }
 
-function recheckVisibleSession() {
-  if (!document.hidden) {
-    visibilityToken += 1;
-    if (currentState.phase === "active" || currentState.phase === "reconnecting") {
-      // Keep the shield UP and DOM empty until Worker confirms fresh relay verification!
-      visibilityShieldLocked = true;
-      clearVisibleMessagesDom();
-      configureShieldView(
-        currentState.phase === "reconnecting" ? "reconnecting" : "verifying",
-        currentState.phase === "reconnecting"
-          ? "Connection interrupted — attempting to reconnect…"
-          : "Verifying room status, deadlines, and MLS epoch with relay…",
-      );
-      showOnlyView("shield");
-    }
-    sendWorker({ type: "ui_visible", visibility_token: visibilityToken });
-    window.clearTimeout(sessionRetryTimer);
-    sessionRetryTimer = null;
-    // Give the worker's own verification and reconnect timers time to run first.
-    if (visibilityShieldLocked && sessionRetryCount < 2) {
-      sessionRetryTimer = window.setTimeout(() => {
-        sessionRetryTimer = null;
-        if (!document.hidden && visibilityShieldLocked && currentState.phase === "active") {
-          sessionRetryCount += 1;
-          recheckVisibleSession();
-        }
-      }, 10_000);
-    }
+let lastSessionCheckAtMs = 0;
+
+function recheckVisibleSession(options = {}) {
+  const { forceReconnect = false, fromNetworkChange = false } = options;
+  if (document.hidden) return;
+  if (currentState.phase !== "active" && currentState.phase !== "reconnecting") {
+    return;
+  }
+
+  const now = Date.now();
+  // Coalesce overlapping browser return / cache / network events so they never start parallel reconnects.
+  if (!forceReconnect && now - lastSessionCheckAtMs < 350) {
+    return;
+  }
+  lastSessionCheckAtMs = now;
+
+  visibilityToken += 1;
+  // Keep the shield UP and DOM empty until Worker confirms fresh relay verification!
+  visibilityShieldLocked = true;
+  clearVisibleMessagesDom();
+  const isReconnecting = currentState.phase === "reconnecting";
+  const reconnectHint =
+    currentState.role === "admin"
+      ? "Connection interrupted — reconnecting in this tab (up to 5 minutes). History stays hidden until verified."
+      : "Connection interrupted — attempting to reconnect. History stays hidden until verified.";
+  configureShieldView(
+    isReconnecting ? "reconnecting" : "verifying",
+    isReconnecting
+      ? reconnectHint
+      : fromNetworkChange
+        ? "Network changed — checking room status, membership, and MLS epoch with relay…"
+        : "Verifying room status, membership, and MLS epoch with relay…",
+  );
+  showOnlyView("shield");
+
+  sendWorker({
+    type: forceReconnect ? "check_connection" : "ui_visible",
+    visibility_token: visibilityToken,
+    force_reconnect: forceReconnect,
+  });
+
+  window.clearTimeout(sessionRetryTimer);
+  sessionRetryTimer = null;
+  // Bounded fallback retry if verification stays unanswered while tab is visible.
+  // Starts strictly after the worker's 4s verification timeout so the worker can escalate to Resume first.
+  if (visibilityShieldLocked && sessionRetryCount < 3) {
+    const backoffMs = Math.min(10_000, 6_000 + sessionRetryCount * 2_000);
+    sessionRetryTimer = window.setTimeout(() => {
+      sessionRetryTimer = null;
+      if (!document.hidden && visibilityShieldLocked && currentState.phase === "active") {
+        sessionRetryCount += 1;
+        recheckVisibleSession({ forceReconnect: false });
+      }
+    }, backoffMs);
   }
 }
 
-els.btnRetrySession.addEventListener("click", recheckVisibleSession);
+els.btnRetrySession.addEventListener("click", () => {
+  sessionRetryCount = 0;
+  recheckVisibleSession({ forceReconnect: true });
+});
 
 document.addEventListener("visibilitychange", () => {
   if (document.hidden) {
     handleVisibilityHidden();
   } else {
-    recheckVisibleSession();
+    sessionRetryCount = 0;
+    recheckVisibleSession({ forceReconnect: false });
   }
 });
 
@@ -913,10 +947,40 @@ window.addEventListener("pagehide", () => {
 });
 
 window.addEventListener("pageshow", (event) => {
-  if (event.persisted && visibilityShieldLocked && sessionRetryTimer === null) {
-    recheckVisibleSession();
+  if (
+    !document.hidden &&
+    (event.persisted || visibilityShieldLocked) &&
+    (currentState.phase === "active" || currentState.phase === "reconnecting")
+  ) {
+    sessionRetryCount = 0;
+    recheckVisibleSession({ forceReconnect: Boolean(event.persisted) });
   }
 });
+
+window.addEventListener("online", () => {
+  if (
+    !document.hidden &&
+    (currentState.phase === "active" || currentState.phase === "reconnecting")
+  ) {
+    sessionRetryCount = 0;
+    recheckVisibleSession({ forceReconnect: true, fromNetworkChange: true });
+  }
+});
+
+if (navigator.connection && typeof navigator.connection.addEventListener === "function") {
+  navigator.connection.addEventListener("change", () => {
+    if (
+      !document.hidden &&
+      (currentState.phase === "active" || currentState.phase === "reconnecting")
+    ) {
+      sessionRetryCount = 0;
+      recheckVisibleSession({
+        forceReconnect: currentState.phase === "reconnecting",
+        fromNetworkChange: true,
+      });
+    }
+  });
+}
 
 // ===== UI Event Handlers =====
 els.btnRoomDrawer.addEventListener("click", () => {

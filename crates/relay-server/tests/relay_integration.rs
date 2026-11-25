@@ -1316,33 +1316,102 @@ async fn expired_room_cannot_be_resurrected_before_sweep_and_stale_admin_cmd_rej
 }
 
 #[tokio::test]
-async fn last_socket_disconnect_immediately_destroys_room_and_invalidates_resume() {
-    let (url, state) = spawn_test_relay(RelayConfig::default()).await;
+async fn solo_admin_disconnect_without_invite_survives_5min_and_starts_new_window_only_after_resume()
+ {
+    let cfg = RelayConfig {
+        admin_reconnect_grace_secs: 300,
+        reconnect_grace_secs: 60,
+        ..Default::default()
+    };
+    let (url, state, clock) = spawn_test_relay_with_clock(cfg, 50_000_000, false).await;
     let (mut admin_ws, room_id, admin_id, resume_token, _, _) = create_initialized_room(&url).await;
     assert_eq!(state.active_room_count().await, 1);
 
-    // Close the ONLY open WebSocket in the room -> room MUST terminate immediately (no 60s wait!).
+    // Solo admin with NO invite disconnects unintentionally -> room is held for 5 minutes!
     admin_ws.close(None).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(120)).await;
-    assert_eq!(state.active_room_count().await, 0);
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    assert_eq!(state.active_room_count().await, 1);
 
-    // Attempting to resume must fail.
-    let mut ws2 = connect_ws(&url, "https://geistr.pages.dev").await.unwrap();
+    // After 120s (> 60s) and sweeper tick, room is still alive.
+    clock.fetch_add(120_000, Ordering::SeqCst);
+    state.sweep_once().await;
+    assert_eq!(state.active_room_count().await, 1);
+
+    // Failed resume attempt at t=200s must NOT extend the original t=300s deadline.
+    clock.fetch_add(80_000, Ordering::SeqCst);
+    let mut bad_ws = connect_ws(&url, "https://geistr.pages.dev").await.unwrap();
     send_msg(
-        &mut ws2,
+        &mut bad_ws,
         &ClientToRelay::ResumeSession {
-            room_id,
-            participant_id: admin_id,
-            resume_token,
-            resume_attempt_id: "attempt-after-close".into(),
+            room_id: room_id.clone(),
+            participant_id: admin_id.clone(),
+            resume_token: "wrong-token".into(),
+            resume_attempt_id: "bad-solo-1".into(),
             last_epoch: 0,
         },
     )
     .await;
-    match recv_msg(&mut ws2).await {
-        RelayToClient::Error { code, .. } => assert_eq!(code, "room_not_found"),
-        other => panic!("expected room_not_found, got {other:?}"),
+    assert!(matches!(
+        recv_msg(&mut bad_ws).await,
+        RelayToClient::Error { code, .. } if code == "invalid_resume_token"
+    ));
+
+    // Valid resume at t=290s (< 300s) succeeds and rotates resume token!
+    clock.fetch_add(90_000, Ordering::SeqCst);
+    let mut ws2 = connect_ws(&url, "https://geistr.pages.dev").await.unwrap();
+    send_msg(
+        &mut ws2,
+        &ClientToRelay::ResumeSession {
+            room_id: room_id.clone(),
+            participant_id: admin_id.clone(),
+            resume_token,
+            resume_attempt_id: "solo-resume-1".into(),
+            last_epoch: 0,
+        },
+    )
+    .await;
+    let rotated_token = match recv_msg(&mut ws2).await {
+        RelayToClient::SessionResumed {
+            resume_token,
+            epoch,
+            ..
+        } => {
+            assert_eq!(epoch, 0);
+            resume_token
+        }
+        other => panic!("expected SessionResumed at t=290s, got {other:?}"),
+    };
+
+    // Second disconnect after successful resume starts a NEW 5-minute window (t=290s -> t=590s).
+    ws2.close(None).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    clock.fetch_add(200_000, Ordering::SeqCst); // t=490s (> original 300s, < new 590s)
+    state.sweep_once().await;
+    assert_eq!(
+        state.active_room_count().await,
+        1,
+        "new disconnect after verified resume must start a fresh 5-minute window"
+    );
+
+    // Past the new 5-minute window (t=591s) -> resume fails and room is destroyed!
+    clock.fetch_add(101_000, Ordering::SeqCst);
+    let mut ws3 = connect_ws(&url, "https://geistr.pages.dev").await.unwrap();
+    send_msg(
+        &mut ws3,
+        &ClientToRelay::ResumeSession {
+            room_id,
+            participant_id: admin_id,
+            resume_token: rotated_token,
+            resume_attempt_id: "solo-resume-expired".into(),
+            last_epoch: 0,
+        },
+    )
+    .await;
+    match recv_msg(&mut ws3).await {
+        RelayToClient::Error { code, .. } => assert_eq!(code, "resume_expired"),
+        other => panic!("expected resume_expired after 5-min grace, got {other:?}"),
     }
+    assert_eq!(state.active_room_count().await, 0);
 }
 
 #[tokio::test]
@@ -1494,7 +1563,7 @@ async fn invite_hold_survives_admin_disconnect_beyond_60s_and_admits_waiting_gue
  {
     let cfg = RelayConfig {
         invite_ttl_secs: 300,
-        invite_hold_max_secs: 300,
+        admin_reconnect_grace_secs: 300,
         reconnect_grace_secs: 60,
         join_reservation_ttl_secs: 60,
         ..Default::default()
@@ -1627,7 +1696,7 @@ async fn invite_hold_survives_admin_disconnect_beyond_60s_and_admits_waiting_gue
 async fn expired_reservation_releases_slot_for_retry_without_extending_any_deadline() {
     let cfg = RelayConfig {
         invite_ttl_secs: 300,
-        invite_hold_max_secs: 300,
+        admin_reconnect_grace_secs: 300,
         reconnect_grace_secs: 60,
         join_reservation_ttl_secs: 20,
         ..Default::default()
@@ -1872,7 +1941,7 @@ async fn invite_hold_is_capped_at_room_expiry_and_panic_wipe_or_leave_ends_immed
 async fn waiting_guest_before_admin_disconnect_still_uses_invite_hold_deadline() {
     let cfg = RelayConfig {
         invite_ttl_secs: 300,
-        invite_hold_max_secs: 300,
+        admin_reconnect_grace_secs: 300,
         reconnect_grace_secs: 60,
         join_reservation_ttl_secs: 120,
         ..Default::default()

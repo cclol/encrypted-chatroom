@@ -236,9 +236,6 @@ struct Room {
     members: HashMap<String, MemberEntry>,
     invites: HashMap<String, InviteEntry>,
     pending_removals: HashSet<String>,
-    /// Fixed deadline for holding an empty room in RAM while a valid unconsumed invite exists.
-    /// Never extended by repeated join or resume attempts; cleared only on verified member resume.
-    empty_hold_deadline_ms: Option<u64>,
 }
 
 impl Room {
@@ -337,19 +334,6 @@ impl Room {
         self.members.len() + self.reserved_slot_count()
     }
 
-    fn max_open_invite_expiry_ms(&self, now: u64) -> Option<u64> {
-        self.invites
-            .values()
-            .filter(|inv| {
-                matches!(
-                    inv.state,
-                    InviteState::Unused | InviteState::Reserved { .. }
-                ) && now < inv.expires_at_ms
-            })
-            .map(|inv| inv.expires_at_ms)
-            .max()
-    }
-
     fn admin_disconnect_deadline_ms(&self) -> Option<u64> {
         match self.members.get(&self.admin_id).map(|m| &m.conn) {
             Some(MemberConn::Disconnected { deadline_ms }) => Some(*deadline_ms),
@@ -358,36 +342,18 @@ impl Room {
     }
 
     fn is_hold_expired(&self, now: u64) -> bool {
-        if let Some(hold) = self.empty_hold_deadline_ms
-            && now >= hold
-        {
-            return true;
-        }
-        if let Some(admin_dl) = self.admin_disconnect_deadline_ms()
-            && now >= admin_dl
-        {
-            return true;
-        }
-        false
+        self.admin_disconnect_deadline_ms()
+            .is_some_and(|admin_dl| now >= admin_dl)
     }
 
     fn should_hold_empty(&self, now: u64) -> bool {
         if now >= self.room_expires_at_ms {
             return false;
         }
-        let Some(hold_dl) = self.empty_hold_deadline_ms else {
-            return false;
-        };
-        if now >= hold_dl {
-            return false;
-        }
-        let Some(admin_dl) = self.admin_disconnect_deadline_ms() else {
-            return false;
-        };
-        if now >= admin_dl {
-            return false;
-        }
-        self.max_open_invite_expiry_ms(now).is_some()
+        // Hold the room in Relay RAM while the admin is within their fixed reconnect grace window
+        // (up to 5 minutes from unintentional disconnect, capped at original room expiry).
+        self.admin_disconnect_deadline_ms()
+            .is_some_and(|admin_dl| now < admin_dl)
     }
 
     fn connected_member_count(&self) -> usize {
@@ -1037,7 +1003,6 @@ impl RelayState {
                 members,
                 invites: HashMap::new(),
                 pending_removals: HashSet::new(),
-                empty_hold_deadline_ms: None,
             },
         );
 
@@ -1829,8 +1794,6 @@ impl RelayState {
             conn_id,
             handle: handle.clone(),
         };
-        // Verified member resume ends any empty-room invite hold window.
-        room.empty_hold_deadline_ms = None;
 
         *binding = Some(ConnBinding {
             room_id: room_id.clone(),
@@ -2144,9 +2107,11 @@ impl RelayState {
                     return;
                 }
 
-                // Cap existing invites, caches, and any empty-hold deadline at the updated room expiry.
-                if let Some(hold) = &mut room.empty_hold_deadline_ms {
-                    *hold = (*hold).min(new_expires);
+                // Cap existing invites, caches, and disconnected member deadlines at the updated room expiry.
+                for m in room.members.values_mut() {
+                    if let MemberConn::Disconnected { deadline_ms } = &mut m.conn {
+                        *deadline_ms = (*deadline_ms).min(new_expires);
+                    }
                 }
                 for inv in room.invites.values_mut() {
                     inv.expires_at_ms = inv.expires_at_ms.min(new_expires);
@@ -2612,15 +2577,19 @@ impl RelayState {
 
         let mut was_active_conn = false;
         let was_paused = room.messaging_paused();
-        let normal_deadline = now
-            .saturating_add(self.config.reconnect_grace_secs.saturating_mul(1000))
+        let grace_secs = match b.role {
+            ParticipantRole::Admin => self.config.admin_reconnect_grace_secs,
+            ParticipantRole::Guest => self.config.reconnect_grace_secs,
+        };
+        let disconnect_deadline = now
+            .saturating_add(grace_secs.saturating_mul(1000))
             .min(room.room_expires_at_ms);
         if let Some(member) = room.members.get_mut(&b.participant_id)
             && matches!(member.conn, MemberConn::Connected { conn_id: cid, .. } if cid == conn_id)
         {
             was_active_conn = true;
             member.conn = MemberConn::Disconnected {
-                deadline_ms: normal_deadline,
+                deadline_ms: disconnect_deadline,
             };
         }
 
@@ -2641,49 +2610,20 @@ impl RelayState {
             }
         }
 
-        // When no admitted members remain connected (even if waiting guests are still attached):
-        // - If a valid, unconsumed invite exists, hold the room in Relay RAM for up to
-        //   `invite_hold_max_secs` (5 min), capped at the remaining invite validity and original room
-        //   expiry, and use the exact same deadline for the admin's resume window.
-        // - Never extend an already-established empty-room hold deadline.
-        // - If no valid unconsumed invite exists, terminate the room immediately as before.
+        // When no admitted members remain connected (whether alone, with waiting guests, or
+        // after all guests disconnected):
+        // - Hold the room in Relay RAM while the admin is within their fixed 5-minute grace window
+        //   (capped at original room expiry). Repeated attempts never extend this deadline.
+        // - Otherwise terminate the room immediately.
         if room.connected_member_count() == 0 {
-            if let Some(max_invite_exp) = room.max_open_invite_expiry_ms(now) {
-                let candidate_hold = now
-                    .saturating_add(self.config.invite_hold_max_secs.saturating_mul(1000))
-                    .min(max_invite_exp)
-                    .min(room.room_expires_at_ms);
-
-                let hold_deadline = match room.empty_hold_deadline_ms {
-                    Some(existing) => existing.min(max_invite_exp).min(room.room_expires_at_ms),
-                    None => candidate_hold,
-                };
-
-                let admin_alive = match room.members.get_mut(&room.admin_id) {
-                    Some(admin) => match &mut admin.conn {
-                        MemberConn::Disconnected { deadline_ms } if now < *deadline_ms => {
-                            if room.empty_hold_deadline_ms.is_none() {
-                                *deadline_ms = hold_deadline;
-                            } else {
-                                *deadline_ms = (*deadline_ms).min(hold_deadline);
-                            }
-                            now < *deadline_ms
-                        }
-                        _ => false,
-                    },
-                    None => false,
-                };
-
-                if admin_alive && now < hold_deadline {
-                    room.empty_hold_deadline_ms = Some(hold_deadline);
-                    info!(
-                        room_id = %b.room_id,
-                        hold_deadline_ms = hold_deadline,
-                        waiting_guests = room.connected_socket_count(),
-                        "last member disconnected with open invite; holding room in RAM for admin resume"
-                    );
-                    return;
-                }
+            if room.should_hold_empty(now) {
+                info!(
+                    room_id = %b.room_id,
+                    admin_deadline_ms = room.admin_disconnect_deadline_ms().unwrap_or(0),
+                    waiting_guests = room.connected_socket_count(),
+                    "last member disconnected; holding room in RAM for admin reconnect grace window"
+                );
+                return;
             }
 
             info!(room_id = %b.room_id, "last WebSocket disconnected; terminating room immediately");

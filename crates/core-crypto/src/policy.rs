@@ -13,12 +13,12 @@ pub const DEFAULT_ROOM_TTL_SECS: u64 = 3600;
 /// Hard maximum room duration from creation (1 hour).
 pub const MAX_ROOM_LIFETIME_SECS: u64 = 3600;
 
-/// Reconnect grace period when a participant disconnects while at least one other socket remains open.
+/// Reconnect grace period for guests (60 seconds).
 pub const RECONNECT_GRACE_SECS: u64 = 60;
 
-/// Maximum room retention & admin resume grace period after the last socket disconnects
-/// while at least one valid, unconsumed invite exists (capped at invite & room expiry).
-pub const INVITE_HOLD_MAX_SECS: u64 = 300;
+/// Reconnect grace period for the room admin after an unintentional disconnect (5 minutes,
+/// always capped at the original room lifetime).
+pub const ADMIN_RECONNECT_GRACE_SECS: u64 = 300;
 
 /// Hard maximum participants per room (1 admin + up to 3 guests).
 pub const MAX_ROOM_MEMBERS: usize = 4;

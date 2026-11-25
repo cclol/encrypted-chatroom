@@ -1,7 +1,7 @@
 use std::env;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-use core_crypto::policy::{INVITE_HOLD_MAX_SECS, RECONNECT_GRACE_SECS};
+use core_crypto::policy::{ADMIN_RECONNECT_GRACE_SECS, RECONNECT_GRACE_SECS};
 
 /// Simple IPv4/IPv6 CIDR matcher for verifying trusted reverse proxies before honoring `X-Forwarded-For`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -124,11 +124,11 @@ pub struct RelayConfig {
     pub keepalive_timeout_secs: u64,
     /// Maximum seconds a single WebSocket write/ping may block before disconnecting a slow consumer.
     pub ws_write_timeout_secs: u64,
-    /// Reconnect grace window in seconds (fixed to 60s in production per Section 6).
+    /// Reconnect grace window for guests in seconds (60s).
     pub reconnect_grace_secs: u64,
-    /// Maximum seconds to keep an empty room in RAM (and allow admin resume) while a valid
-    /// unconsumed invite exists (always capped at invite expiry and original room expiry).
-    pub invite_hold_max_secs: u64,
+    /// Reconnect grace window for the room admin after an unintentional disconnect (5 min,
+    /// always capped at the original room lifetime).
+    pub admin_reconnect_grace_secs: u64,
     /// Maximum time a pending join reservation is held before timing out.
     pub join_reservation_ttl_secs: u64,
     /// Bounded delivery window in ms after PanicWipe before force-closing room sockets.
@@ -170,7 +170,7 @@ impl Default for RelayConfig {
             keepalive_timeout_secs: 15,
             ws_write_timeout_secs: 10,
             reconnect_grace_secs: RECONNECT_GRACE_SECS,
-            invite_hold_max_secs: INVITE_HOLD_MAX_SECS,
+            admin_reconnect_grace_secs: ADMIN_RECONNECT_GRACE_SECS,
             join_reservation_ttl_secs: 60,
             wipe_delivery_grace_ms: 400,
             max_concurrent_rooms: 256,
