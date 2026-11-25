@@ -362,6 +362,7 @@ function syncVisualViewport() {
   const offsetTop = vv ? Math.max(0, Math.round(vv.offsetTop)) : 0;
   const isZoomed = Boolean(vv && vv.scale > 1.05);
   const inputFocused = isTextInputFocused();
+  const wasNearBottom = isNearBottom();
 
   if (!isZoomed && (!inputFocused || height > baseViewportHeight)) {
     baseViewportHeight = Math.max(window.innerHeight || 0, height);
@@ -378,7 +379,6 @@ function syncVisualViewport() {
     referenceHeight > 0 &&
     heightDrop >= 120 &&
     height < referenceHeight * 0.85;
-  const wasNearBottom = isNearBottom();
   document.body.classList.toggle("keyboard-open", keyboardLikelyOpen);
 
   if (document.body.classList.contains("in-chat") && wasNearBottom) {

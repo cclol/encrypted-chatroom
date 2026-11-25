@@ -68,6 +68,9 @@ body.in-chat {
 }
 
 body.in-chat .shell {
+  position: fixed;
+  top: var(--vv-offset-top, 0px);
+  inset-inline: 0;
   height: var(--vvh, 100dvh);
   min-height: 0;
   padding:
@@ -76,7 +79,6 @@ body.in-chat .shell {
     0
     env(safe-area-inset-left);
   gap: 0;
-  transform: translateY(var(--vv-offset-top, 0px));
 }
 
 body.in-chat .topbar {
