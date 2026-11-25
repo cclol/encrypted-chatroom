@@ -7,7 +7,7 @@ End-to-end encrypted zero-trace browser chat (Version 1) for up to four particip
 | GitHub repository & Cargo workspace | `encrypted-chatroom` |
 | Cloudflare Pages project | `geistr` |
 | Planned production origin | `https://geistr.pages.dev` (configurable via `ALLOWED_ORIGIN`) |
-| Relay hosting | Koyeb Free (Frankfurt), native Rust/Axum container (`Dockerfile`) |
+| Relay hosting | Render Free (Frankfurt, `render.yaml`) — drop-in compatible with Koyeb Free (Frankfurt) via `Dockerfile` |
 
 ## Architecture & Layout
 
@@ -85,5 +85,6 @@ Open `http://127.0.0.1:8000` in your browser:
 
 ## Deployment
 
-- **Relay (Koyeb Free, Frankfurt)**: Build/deploy `Dockerfile` and configure `ALLOWED_ORIGIN=https://geistr.pages.dev` (or the actual assigned Pages origin).
-- **Frontend (Cloudflare Pages `geistr`)**: Trigger `.github/workflows/deploy-pages.yml` with the production Koyeb WSS URL (protected `production` GitHub Environment). The workflow injects the exact Koyeb origin into both `web/index.html` and the `connect-src` CSP directive in `web/_headers`.
+- **Relay (Render Free, Frankfurt — current default)**: Connect this repository in Render as a **Blueprint** using `render.yaml` (Docker runtime, Frankfurt region, Free plan, `/healthz` health check, `ALLOWED_ORIGIN=https://geistr.pages.dev`). Note that Render Free spins down after 15 minutes with no active connections (first cold start takes ~30–60s); active rooms stay awake via the 20s keep-alive ping.
+- **Switching to Koyeb Free (Frankfurt) later**: Deploy the exact same `Dockerfile` on Koyeb with `ALLOWED_ORIGIN=https://geistr.pages.dev`, then re-run the Cloudflare Pages workflow below with your Koyeb `wss://.../ws` URL—no code changes required.
+- **Frontend (Cloudflare Pages `geistr`)**: Trigger `.github/workflows/deploy-pages.yml` with the exact production Relay WSS URL (`wss://<your-relay-host>/ws`, protected `production` GitHub Environment). The workflow injects the exact relay origin into both `web/index.html` and the `connect-src` CSP directive in `web/_headers`.

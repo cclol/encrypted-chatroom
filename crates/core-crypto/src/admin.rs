@@ -10,6 +10,7 @@ use crate::{CryptoError, fill_random};
 
 const ADMIN_FP_DOMAIN: &[u8] = b"geistr-admin-fp-v1";
 const ADMIN_CMD_DOMAIN: &[u8] = b"geistr-admin-cmd-v1";
+const ADMIN_MLS_BINDING_DOMAIN: &[u8] = b"geistr-admin-mls-binding-v1";
 
 /// Dedicated Ed25519 signing keypair for room admin control commands.
 /// Kept strictly separate from MLS identity keys, local RAM history keys, and resume tokens.
@@ -62,6 +63,14 @@ impl AdminSigningKey {
         compute_admin_fingerprint(&self.verifying_key_bytes(), &self.room_id)
     }
 
+    /// Signs a domain-separated binding that cryptographically links this invite-anchored
+    /// AdminSigningKey to the actual MLS Ed25519 signature public key for this room instance.
+    pub fn sign_mls_binding(&self, participant_id: &str, mls_signature_pubkey: &[u8]) -> String {
+        let msg = canonical_mls_binding_bytes(&self.room_id, participant_id, mls_signature_pubkey);
+        let sig = self.signing_key.sign(&msg);
+        URL_SAFE_NO_PAD.encode(sig.to_bytes())
+    }
+
     /// Signs a new admin control command with a strictly monotonically increasing sequence number.
     pub fn sign_command(
         &mut self,
@@ -85,6 +94,66 @@ impl AdminSigningKey {
             signature_b64: URL_SAFE_NO_PAD.encode(sig.to_bytes()),
         })
     }
+}
+
+fn canonical_mls_binding_bytes(
+    room_id: &str,
+    participant_id: &str,
+    mls_signature_pubkey: &[u8],
+) -> Vec<u8> {
+    let role = b"admin";
+    let mut out = Vec::with_capacity(
+        ADMIN_MLS_BINDING_DOMAIN.len()
+            + 4
+            + room_id.len()
+            + 4
+            + participant_id.len()
+            + 4
+            + role.len()
+            + 4
+            + mls_signature_pubkey.len(),
+    );
+    out.extend_from_slice(ADMIN_MLS_BINDING_DOMAIN);
+    out.extend_from_slice(&(room_id.len() as u32).to_be_bytes());
+    out.extend_from_slice(room_id.as_bytes());
+    out.extend_from_slice(&(participant_id.len() as u32).to_be_bytes());
+    out.extend_from_slice(participant_id.as_bytes());
+    out.extend_from_slice(&(role.len() as u32).to_be_bytes());
+    out.extend_from_slice(role);
+    out.extend_from_slice(&(mls_signature_pubkey.len() as u32).to_be_bytes());
+    out.extend_from_slice(mls_signature_pubkey);
+    out
+}
+
+/// Verifies that `mls_signature_pubkey` is cryptographically bound to `admin_pubkey_bytes`
+/// for the given `room_id`, `participant_id`, and `admin` role.
+pub fn verify_mls_admin_binding(
+    admin_pubkey_bytes: &[u8; 32],
+    room_id: &str,
+    participant_id: &str,
+    mls_signature_pubkey: &[u8],
+    binding_sig_b64: &str,
+) -> Result<(), CryptoError> {
+    if mls_signature_pubkey.is_empty() {
+        return Err(CryptoError::AdminVerificationFailed(
+            "empty MLS signature public key".into(),
+        ));
+    }
+    let vk = VerifyingKey::from_bytes(admin_pubkey_bytes)
+        .map_err(|e| CryptoError::AdminVerificationFailed(format!("invalid admin pubkey: {e}")))?;
+    let sig_raw = URL_SAFE_NO_PAD.decode(binding_sig_b64).map_err(|e| {
+        CryptoError::AdminVerificationFailed(format!("invalid MLS binding signature b64: {e}"))
+    })?;
+    let sig_arr: [u8; 64] = sig_raw.try_into().map_err(|_| {
+        CryptoError::AdminVerificationFailed("MLS binding signature must be 64 bytes".into())
+    })?;
+    let signature = Signature::from_bytes(&sig_arr);
+    let msg = canonical_mls_binding_bytes(room_id, participant_id, mls_signature_pubkey);
+    vk.verify(&msg, &signature).map_err(|e| {
+        CryptoError::AdminVerificationFailed(format!(
+            "MLS admin key binding signature verification failed: {e}"
+        ))
+    })
 }
 
 /// Computes the deterministic SHA-256 fingerprint binding an admin public key to a specific room instance.
@@ -196,7 +265,8 @@ pub fn verify_admin_command_signature(
     Ok(())
 }
 
-/// Stateful verifier that enforces signature validity, room binding, and strictly increasing sequence numbers.
+/// Stateful verifier that enforces signature validity, room binding, epoch binding,
+/// and strictly increasing sequence numbers.
 #[derive(Debug, Clone)]
 pub struct AdminCommandVerifier {
     room_id: String,
@@ -218,6 +288,10 @@ impl AdminCommandVerifier {
         })
     }
 
+    pub fn admin_pubkey_bytes(&self) -> [u8; 32] {
+        self.admin_pubkey_bytes
+    }
+
     pub fn fingerprint(&self) -> String {
         compute_admin_fingerprint(&self.admin_pubkey_bytes, &self.room_id)
     }
@@ -226,13 +300,80 @@ impl AdminCommandVerifier {
         self.last_seq
     }
 
-    pub fn verify_and_advance(&mut self, cmd: &SignedAdminCommand) -> Result<(), CryptoError> {
+    /// Validates a live admin command against the current MLS epoch WITHOUT advancing `last_seq`.
+    /// Call `commit_seq(cmd.body.seq)` only after all domain/deadline/payload preconditions succeed.
+    pub fn check_live(
+        &self,
+        cmd: &SignedAdminCommand,
+        expected_epoch: u64,
+    ) -> Result<(), CryptoError> {
         verify_admin_command_signature(cmd, &self.room_id, &self.admin_pubkey_bytes)?;
         if cmd.body.seq <= self.last_seq {
             return Err(CryptoError::ReplayDetected);
         }
-        self.last_seq = cmd.body.seq;
+        if cmd.body.epoch != expected_epoch {
+            return Err(CryptoError::EpochMismatch {
+                expected: expected_epoch,
+                got: cmd.body.epoch,
+            });
+        }
         Ok(())
+    }
+
+    /// Commits the verified sequence number after all preconditions have passed.
+    pub fn commit_seq(&mut self, seq: u64) -> Result<(), CryptoError> {
+        if seq <= self.last_seq {
+            return Err(CryptoError::ReplayDetected);
+        }
+        self.last_seq = seq;
+        Ok(())
+    }
+
+    /// Convenience helper for live commands when no external preconditions remain.
+    pub fn verify_and_advance_live(
+        &mut self,
+        cmd: &SignedAdminCommand,
+        expected_epoch: u64,
+    ) -> Result<(), CryptoError> {
+        self.check_live(cmd, expected_epoch)?;
+        self.commit_seq(cmd.body.seq)
+    }
+
+    /// Validates a historical `SetPolicy` snapshot delivered during JoinAccepted or SessionResumed.
+    ///
+    /// Rules:
+    /// - Must be a validly signed `SetPolicy` for this room.
+    /// - Its signed epoch must not exceed `current_room_epoch` (`cmd.body.epoch <= current_room_epoch`).
+    /// - Its sequence number must not regress below `last_seq` (`cmd.body.seq >= last_seq`).
+    ///   (Equal `seq` is allowed on SessionResumed when no new policy was issued during disconnect.)
+    pub fn verify_historical_policy_snapshot(
+        &mut self,
+        cmd: &SignedAdminCommand,
+        current_room_epoch: u64,
+    ) -> Result<RoomPolicy, CryptoError> {
+        verify_admin_command_signature(cmd, &self.room_id, &self.admin_pubkey_bytes)?;
+        let policy = match cmd.body.payload.policy() {
+            Some(Ok(p)) => p,
+            Some(Err(e)) => return Err(e),
+            None => {
+                return Err(CryptoError::InvalidPolicy(
+                    "historical policy snapshot must be a SetPolicy command".into(),
+                ));
+            }
+        };
+        if cmd.body.epoch > current_room_epoch {
+            return Err(CryptoError::EpochMismatch {
+                expected: current_room_epoch,
+                got: cmd.body.epoch,
+            });
+        }
+        if cmd.body.seq < self.last_seq {
+            return Err(CryptoError::ReplayDetected);
+        }
+        if cmd.body.seq > self.last_seq {
+            self.last_seq = cmd.body.seq;
+        }
+        Ok(policy)
     }
 }
 
@@ -241,7 +382,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn signs_verifies_and_rejects_replays_and_tampering() {
+    fn signs_verifies_and_rejects_replays_tampering_and_epoch_mismatch() {
         let mut signer = AdminSigningKey::generate("room-abc").unwrap();
         let mut verifier =
             AdminCommandVerifier::new("room-abc", signer.verifying_key_bytes()).unwrap();
@@ -256,10 +397,23 @@ mod tests {
                 },
             )
             .unwrap();
-        assert!(verifier.verify_and_advance(&cmd1).is_ok());
+        // Wrong expected epoch must fail WITHOUT advancing last_seq.
+        assert!(matches!(
+            verifier.verify_and_advance_live(&cmd1, 1),
+            Err(CryptoError::EpochMismatch {
+                expected: 1,
+                got: 0
+            })
+        ));
+        assert_eq!(verifier.last_seq(), 0);
+
+        // Matching epoch succeeds.
+        assert!(verifier.verify_and_advance_live(&cmd1, 0).is_ok());
+        assert_eq!(verifier.last_seq(), 1);
+
         // Replay must fail.
         assert!(matches!(
-            verifier.verify_and_advance(&cmd1),
+            verifier.verify_and_advance_live(&cmd1, 0),
             Err(CryptoError::ReplayDetected)
         ));
 
@@ -269,7 +423,7 @@ mod tests {
             .unwrap();
         cmd2.body.epoch = 99;
         assert!(matches!(
-            verifier.verify_and_advance(&cmd2),
+            verifier.verify_and_advance_live(&cmd2, 99),
             Err(CryptoError::InvalidSignature(_))
         ));
 
@@ -277,8 +431,135 @@ mod tests {
         let mut other_verifier =
             AdminCommandVerifier::new("room-other", signer.verifying_key_bytes()).unwrap();
         assert!(matches!(
-            other_verifier.verify_and_advance(&cmd1),
+            other_verifier.verify_and_advance_live(&cmd1, 0),
             Err(CryptoError::RoomMismatch)
         ));
+    }
+
+    #[test]
+    fn historical_policy_snapshot_rules_enforce_epoch_bound_and_no_seq_rollback() {
+        let mut signer = AdminSigningKey::generate("room-hist").unwrap();
+        let mut verifier =
+            AdminCommandVerifier::new("room-hist", signer.verifying_key_bytes()).unwrap();
+
+        let cmd_e0 = signer
+            .sign_command(
+                0,
+                AdminCommandPayload::SetPolicy {
+                    msg_ttl_secs: 1800,
+                    room_ttl_secs: 3600,
+                },
+            )
+            .unwrap();
+        let cmd_e2 = signer
+            .sign_command(
+                2,
+                AdminCommandPayload::SetPolicy {
+                    msg_ttl_secs: 300,
+                    room_ttl_secs: 1800,
+                },
+            )
+            .unwrap();
+
+        // Snapshot from future epoch (> current_room_epoch) must fail.
+        assert!(matches!(
+            verifier.verify_historical_policy_snapshot(&cmd_e2, 1),
+            Err(CryptoError::EpochMismatch {
+                expected: 1,
+                got: 2
+            })
+        ));
+        assert_eq!(verifier.last_seq(), 0);
+
+        // Snapshot from epoch 0 accepted when current epoch is 3.
+        let p0 = verifier
+            .verify_historical_policy_snapshot(&cmd_e0, 3)
+            .unwrap();
+        assert_eq!(p0.msg_ttl_secs, 1800);
+        assert_eq!(verifier.last_seq(), 1);
+
+        // Newer snapshot accepted.
+        let p2 = verifier
+            .verify_historical_policy_snapshot(&cmd_e2, 3)
+            .unwrap();
+        assert_eq!(p2.msg_ttl_secs, 300);
+        assert_eq!(verifier.last_seq(), 2);
+
+        // Same seq on resume is idempotent.
+        assert!(
+            verifier
+                .verify_historical_policy_snapshot(&cmd_e2, 3)
+                .is_ok()
+        );
+
+        // Rollback to older seq is rejected.
+        assert!(matches!(
+            verifier.verify_historical_policy_snapshot(&cmd_e0, 3),
+            Err(CryptoError::ReplayDetected)
+        ));
+    }
+
+    #[test]
+    fn mls_admin_binding_signature_binds_room_participant_and_mls_key() {
+        let signer = AdminSigningKey::generate("room-bind").unwrap();
+        let other_signer = AdminSigningKey::generate("room-bind").unwrap();
+        let mls_pk = [42u8; 32];
+        let other_mls_pk = [7u8; 32];
+
+        let sig = signer.sign_mls_binding("admin-1", &mls_pk);
+        assert!(
+            verify_mls_admin_binding(
+                &signer.verifying_key_bytes(),
+                "room-bind",
+                "admin-1",
+                &mls_pk,
+                &sig,
+            )
+            .is_ok()
+        );
+        // Different MLS key fails.
+        assert!(
+            verify_mls_admin_binding(
+                &signer.verifying_key_bytes(),
+                "room-bind",
+                "admin-1",
+                &other_mls_pk,
+                &sig,
+            )
+            .is_err()
+        );
+        // Different room fails.
+        assert!(
+            verify_mls_admin_binding(
+                &signer.verifying_key_bytes(),
+                "room-other",
+                "admin-1",
+                &mls_pk,
+                &sig,
+            )
+            .is_err()
+        );
+        // Different participant_id fails.
+        assert!(
+            verify_mls_admin_binding(
+                &signer.verifying_key_bytes(),
+                "room-bind",
+                "admin-2",
+                &mls_pk,
+                &sig,
+            )
+            .is_err()
+        );
+        // Different admin key fails.
+        assert!(
+            verify_mls_admin_binding(
+                &other_signer.verifying_key_bytes(),
+                "room-bind",
+                "admin-1",
+                &mls_pk,
+                &sig,
+            )
+            .is_err()
+        );
     }
 }

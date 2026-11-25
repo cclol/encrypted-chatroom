@@ -23,6 +23,8 @@ pub enum CryptoError {
     InvalidSignature(String),
     #[error("replayed or out-of-order admin command sequence")]
     ReplayDetected,
+    #[error("epoch mismatch in authenticated command (expected {expected}, got {got})")]
+    EpochMismatch { expected: u64, got: u64 },
     #[error("room mismatch in authenticated command")]
     RoomMismatch,
     #[error("encoding or decoding error: {0}")]

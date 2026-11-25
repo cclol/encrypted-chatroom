@@ -1,9 +1,13 @@
 use std::net::SocketAddr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use core_crypto::admin::{AdminCommandPayload, AdminSigningKey, compute_admin_fingerprint};
+use core_crypto::admin::{
+    AdminCommandPayload, AdminCommandVerifier, AdminSigningKey, compute_admin_fingerprint,
+};
 use core_crypto::mls::{MlsIncomingEvent, MlsSession};
 use core_crypto::policy::RoomPolicy;
 use core_crypto::protocol::{ChatAppPayload, ClientToRelay, RelayToClient};
@@ -11,7 +15,7 @@ use core_crypto::{random_token_b64url, sha256_hex};
 use futures_util::{SinkExt, StreamExt};
 use relay_server::build_router;
 use relay_server::config::RelayConfig;
-use relay_server::state::RelayState;
+use relay_server::state::{RelayState, now_ms};
 use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -19,7 +23,7 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 type WsStream =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
-async fn spawn_test_relay(mut config: RelayConfig) -> (String, std::sync::Arc<RelayState>) {
+async fn spawn_test_relay(mut config: RelayConfig) -> (String, Arc<RelayState>) {
     config.allowed_origin = "https://geistr.pages.dev".into();
     config.sweep_interval_ms = 50;
     config.wipe_delivery_grace_ms = 100;
@@ -37,6 +41,35 @@ async fn spawn_test_relay(mut config: RelayConfig) -> (String, std::sync::Arc<Re
         .unwrap();
     });
     (format!("ws://{addr}/ws"), state)
+}
+
+async fn spawn_test_relay_with_clock(
+    mut config: RelayConfig,
+    initial_ms: u64,
+    run_sweeper: bool,
+) -> (String, Arc<RelayState>, Arc<AtomicU64>) {
+    config.allowed_origin = "https://geistr.pages.dev".into();
+    config.sweep_interval_ms = 50;
+    config.wipe_delivery_grace_ms = 100;
+    let clock = Arc::new(AtomicU64::new(initial_ms));
+    let clock_clone = Arc::clone(&clock);
+    let state =
+        RelayState::new_with_clock(config, Arc::new(move || clock_clone.load(Ordering::SeqCst)));
+    if run_sweeper {
+        state.spawn_sweeper();
+    }
+    let app = build_router(state.clone());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+    (format!("ws://{addr}/ws"), state, clock)
 }
 
 #[allow(clippy::result_large_err)]
@@ -122,8 +155,7 @@ async fn create_initialized_room(
         RelayToClient::PolicyUpdated { .. }
     ));
 
-    let mut admin_mls =
-        MlsSession::new(&room_id, &admin_id, true, Some(admin_key.fingerprint())).unwrap();
+    let mut admin_mls = MlsSession::new_admin(&room_id, &admin_id, &admin_key).unwrap();
     admin_mls.create_group().unwrap();
 
     (
@@ -167,10 +199,10 @@ async fn admit_guest(
     admin_fp: &str,
     admin_ws: &mut WsStream,
     admin_mls: &mut MlsSession,
-) -> (WsStream, String, String, MlsSession) {
+) -> (WsStream, String, String, String, MlsSession) {
     let mut guest_ws = connect_ws(url, "https://geistr.pages.dev").await.unwrap();
     let provisional_id = random_token_b64url(6).unwrap();
-    let mut guest_mls = MlsSession::new(room_id, &provisional_id, false, None).unwrap();
+    let mut guest_mls = MlsSession::new_guest(room_id, &provisional_id).unwrap();
     let kp = guest_mls.generate_key_package().unwrap();
 
     send_msg(
@@ -188,7 +220,7 @@ async fn admit_guest(
         RelayToClient::JoinPending { .. }
     ));
 
-    // Admin receives GuestJoinRequest and admits automatically.
+    // Admin receives GuestJoinRequest, stages Add Commit, waits for CommitAccepted, then applies & acks!
     let (reservation_id, guest_id, kp_b64) = match recv_msg(admin_ws).await {
         RelayToClient::GuestJoinRequest {
             reservation_id,
@@ -199,36 +231,66 @@ async fn admit_guest(
     };
 
     let kp_bytes = STANDARD.decode(&kp_b64).unwrap();
-    let add_out = admin_mls.add_member(&kp_bytes).unwrap();
+    let staged = admin_mls.stage_add_member(&kp_bytes).unwrap();
+    let commit_id = random_token_b64url(10).unwrap();
 
     send_msg(
         admin_ws,
         &ClientToRelay::CompleteJoin {
             reservation_id,
             guest_id: guest_id.clone(),
-            commit_b64: STANDARD.encode(&add_out.commit_bytes),
-            welcome_b64: STANDARD.encode(&add_out.welcome_bytes),
-            new_epoch: add_out.new_epoch,
+            commit_id: commit_id.clone(),
+            expected_epoch: staged.expected_epoch,
+            commit_b64: STANDARD.encode(&staged.commit_bytes),
+            welcome_b64: STANDARD.encode(&staged.welcome_bytes),
+            new_epoch: staged.new_epoch,
         },
     )
     .await;
 
-    // Admin gets MemberStatus.
-    assert!(matches!(
-        recv_msg(admin_ws).await,
-        RelayToClient::MemberStatus { .. }
-    ));
+    // Admin gets CommitAccepted, applies pending commit, and sends AckCommit.
+    match recv_msg(admin_ws).await {
+        RelayToClient::CommitAccepted {
+            commit_id: cid,
+            new_epoch,
+            ..
+        } => {
+            assert_eq!(cid, commit_id);
+            let (applied, _) = admin_mls.apply_pending_commit().unwrap();
+            assert_eq!(applied, new_epoch);
+            send_msg(
+                admin_ws,
+                &ClientToRelay::AckCommit {
+                    commit_id: cid,
+                    epoch: new_epoch,
+                },
+            )
+            .await;
+        }
+        other => panic!("expected CommitAccepted, got {other:?}"),
+    }
 
-    // Guest gets JoinAccepted and joins MLS group + verifies admin fingerprint.
-    let (accepted_id, resume_token, welcome_b64, admin_pubkey_b64) =
+    // Guest gets JoinAccepted, verifies admin key + MLS binding + policy, and sends AckCommit.
+    let (accepted_id, resume_token, welcome_b64, admin_pubkey_b64, cid, epoch, policy_cmd) =
         match recv_msg(&mut guest_ws).await {
             RelayToClient::JoinAccepted {
                 participant_id,
                 resume_token,
                 welcome_b64,
                 admin_pubkey_b64,
+                commit_id,
+                epoch,
+                latest_policy_cmd,
                 ..
-            } => (participant_id, resume_token, welcome_b64, admin_pubkey_b64),
+            } => (
+                participant_id,
+                resume_token,
+                welcome_b64,
+                admin_pubkey_b64,
+                commit_id,
+                epoch,
+                latest_policy_cmd,
+            ),
             other => panic!("expected JoinAccepted, got {other:?}"),
         };
     assert_eq!(accepted_id, guest_id);
@@ -236,11 +298,32 @@ async fn admit_guest(
     assert_eq!(compute_admin_fingerprint(&pk, room_id), admin_fp);
 
     let welcome_bytes = STANDARD.decode(&welcome_b64).unwrap();
-    guest_mls
-        .join_from_welcome(&welcome_bytes, admin_fp)
-        .expect("guest must verify admin identity in MLS roster");
+    let joined_ep = guest_mls
+        .join_from_welcome(&welcome_bytes, &pk, admin_fp)
+        .expect("guest must verify cryptographic admin->MLS key binding");
+    assert_eq!(joined_ep, epoch);
 
-    (guest_ws, provisional_id, resume_token, guest_mls)
+    let mut verifier = AdminCommandVerifier::new(room_id, pk).unwrap();
+    verifier
+        .verify_historical_policy_snapshot(&policy_cmd, epoch)
+        .unwrap();
+
+    send_msg(
+        &mut guest_ws,
+        &ClientToRelay::AckCommit {
+            commit_id: cid,
+            epoch,
+        },
+    )
+    .await;
+
+    (
+        guest_ws,
+        accepted_id,
+        provisional_id,
+        resume_token,
+        guest_mls,
+    )
 }
 
 #[tokio::test]
@@ -257,19 +340,19 @@ async fn parallel_joins_with_same_token_take_at_most_one_slot_and_fifth_person_r
         create_initialized_room(&url).await;
     let admin_fp = admin_key.fingerprint();
 
-    // Test 1: Two parallel joins with the EXACT same invite token -> at most 1 succeeds.
+    // Two parallel joins with the EXACT same invite token -> at most 1 succeeds.
     let shared_token = register_invite(&mut admin_ws, &mut admin_key, 0).await;
 
     let mut g1 = connect_ws(&url, "https://geistr.pages.dev").await.unwrap();
     let mut g2 = connect_ws(&url, "https://geistr.pages.dev").await.unwrap();
     let kp1 = STANDARD.encode(
-        MlsSession::new(&room_id, "g1", false, None)
+        MlsSession::new_guest(&room_id, "g1")
             .unwrap()
             .generate_key_package()
             .unwrap(),
     );
     let kp2 = STANDARD.encode(
-        MlsSession::new(&room_id, "g2", false, None)
+        MlsSession::new_guest(&room_id, "g2")
             .unwrap()
             .generate_key_package()
             .unwrap(),
@@ -299,16 +382,10 @@ async fn parallel_joins_with_same_token_take_at_most_one_slot_and_fifth_person_r
         .iter()
         .filter(|r| matches!(r, RelayToClient::Error { .. }))
         .count();
-    assert_eq!(
-        pending_count, 1,
-        "exactly one parallel joiner may reserve the token"
-    );
-    assert_eq!(
-        error_count, 1,
-        "the second parallel joiner must be rejected"
-    );
+    assert_eq!(pending_count, 1);
+    assert_eq!(error_count, 1);
 
-    // Admit the winning guest (seat 2 of 4).
+    // Admit winning guest (seat 2 of 4).
     let (res_id, guest_id, kp_b64) = match recv_msg(&mut admin_ws).await {
         RelayToClient::GuestJoinRequest {
             reservation_id,
@@ -317,28 +394,40 @@ async fn parallel_joins_with_same_token_take_at_most_one_slot_and_fifth_person_r
         } => (reservation_id, guest_id, key_package_b64),
         other => panic!("expected GuestJoinRequest, got {other:?}"),
     };
-    let add = admin_mls
-        .add_member(&STANDARD.decode(&kp_b64).unwrap())
+    let staged = admin_mls
+        .stage_add_member(&STANDARD.decode(&kp_b64).unwrap())
         .unwrap();
+    let cid = random_token_b64url(10).unwrap();
     send_msg(
         &mut admin_ws,
         &ClientToRelay::CompleteJoin {
             reservation_id: res_id,
             guest_id,
-            commit_b64: STANDARD.encode(&add.commit_bytes),
-            welcome_b64: STANDARD.encode(&add.welcome_bytes),
-            new_epoch: add.new_epoch,
+            commit_id: cid.clone(),
+            expected_epoch: staged.expected_epoch,
+            commit_b64: STANDARD.encode(&staged.commit_bytes),
+            welcome_b64: STANDARD.encode(&staged.welcome_bytes),
+            new_epoch: staged.new_epoch,
         },
     )
     .await;
     assert!(matches!(
         recv_msg(&mut admin_ws).await,
-        RelayToClient::MemberStatus { .. }
+        RelayToClient::CommitAccepted { .. }
     ));
+    admin_mls.apply_pending_commit().unwrap();
+    send_msg(
+        &mut admin_ws,
+        &ClientToRelay::AckCommit {
+            commit_id: cid,
+            epoch: admin_mls.current_epoch(),
+        },
+    )
+    .await;
 
-    // Admit Guest 2 (seat 3 of 4) and Guest 3 (seat 4 of 4).
+    // Admit Guest 2 (seat 3) and Guest 3 (seat 4).
     let tok2 = register_invite(&mut admin_ws, &mut admin_key, admin_mls.current_epoch()).await;
-    let (_g2_ws, _, _, _) = admit_guest(
+    let (_g2_ws, _, _, _, _) = admit_guest(
         &url,
         &room_id,
         &tok2,
@@ -349,7 +438,7 @@ async fn parallel_joins_with_same_token_take_at_most_one_slot_and_fifth_person_r
     .await;
 
     let tok3 = register_invite(&mut admin_ws, &mut admin_key, admin_mls.current_epoch()).await;
-    let (_g3_ws, _, _, _) = admit_guest(
+    let (_g3_ws, _, _, _, _) = admit_guest(
         &url,
         &room_id,
         &tok3,
@@ -359,11 +448,11 @@ async fn parallel_joins_with_same_token_take_at_most_one_slot_and_fifth_person_r
     )
     .await;
 
-    // Test 2: A 5th person MUST be rejected even with a freshly issued invite token!
+    // A 5th person MUST be rejected with room_full.
     let tok4 = register_invite(&mut admin_ws, &mut admin_key, admin_mls.current_epoch()).await;
     let mut g5 = connect_ws(&url, "https://geistr.pages.dev").await.unwrap();
     let kp5 = STANDARD.encode(
-        MlsSession::new(&room_id, "g5", false, None)
+        MlsSession::new_guest(&room_id, "g5")
             .unwrap()
             .generate_key_package()
             .unwrap(),
@@ -385,7 +474,7 @@ async fn parallel_joins_with_same_token_take_at_most_one_slot_and_fifth_person_r
 }
 
 #[tokio::test]
-async fn full_e2e_mls_flow_removal_blocks_former_guest_and_panic_wipe() {
+async fn full_e2e_mls_flow_removal_requires_ack_before_unpause_and_blocks_former_guest() {
     let (url, state) = spawn_test_relay(RelayConfig::default()).await;
     let (mut admin_ws, room_id, _, _, mut admin_key, mut admin_mls) =
         create_initialized_room(&url).await;
@@ -393,7 +482,7 @@ async fn full_e2e_mls_flow_removal_blocks_former_guest_and_panic_wipe() {
 
     // Admit Guest 1 and Guest 2.
     let tok1 = register_invite(&mut admin_ws, &mut admin_key, 0).await;
-    let (mut g1_ws, g1_mls_id, _, mut g1_mls) = admit_guest(
+    let (mut g1_ws, _g1_relay_id, g1_mls_id, _, mut g1_mls) = admit_guest(
         &url,
         &room_id,
         &tok1,
@@ -404,7 +493,7 @@ async fn full_e2e_mls_flow_removal_blocks_former_guest_and_panic_wipe() {
     .await;
 
     let tok2 = register_invite(&mut admin_ws, &mut admin_key, admin_mls.current_epoch()).await;
-    let (mut g2_ws, _, _, mut g2_mls) = admit_guest(
+    let (mut g2_ws, _, _, _, mut g2_mls) = admit_guest(
         &url,
         &room_id,
         &tok2,
@@ -414,17 +503,23 @@ async fn full_e2e_mls_flow_removal_blocks_former_guest_and_panic_wipe() {
     )
     .await;
 
-    // Guest 1 receives the Add Commit for Guest 2 so all 3 members share Epoch 2.
+    // Guest 1 receives Add Commit for Guest 2, applies, and sends AckCommit.
     match recv_msg(&mut g1_ws).await {
-        RelayToClient::MlsCommit { commit_b64, .. } => {
+        RelayToClient::MlsCommit {
+            commit_id,
+            epoch,
+            commit_b64,
+            ..
+        } => {
             g1_mls
                 .process_incoming(&STANDARD.decode(&commit_b64).unwrap())
                 .unwrap();
+            send_msg(&mut g1_ws, &ClientToRelay::AckCommit { commit_id, epoch }).await;
         }
         other => panic!("expected MlsCommit for g1, got {other:?}"),
     }
 
-    // Exchange encrypted message across all 3 participants.
+    // Exchange encrypted message across all 3 participants in Epoch 2.
     let payload = ChatAppPayload {
         message_id: "msg-1".into(),
         text: "Secret message in epoch 2".into(),
@@ -452,7 +547,7 @@ async fn full_e2e_mls_flow_removal_blocks_former_guest_and_panic_wipe() {
         }
     }
 
-    // Guest 1 leaves permanently -> messaging pauses until Admin commits MLS Remove!
+    // Guest 1 leaves permanently -> messaging pauses until Admin commits AND all remaining connected members ack!
     send_msg(&mut g1_ws, &ClientToRelay::LeaveRoom).await;
 
     let removed_relay_pid = match recv_msg(&mut admin_ws).await {
@@ -474,53 +569,43 @@ async fn full_e2e_mls_flow_removal_blocks_former_guest_and_panic_wipe() {
         }
     ));
 
-    // Trying to send while paused MUST be rejected by relay!
-    send_msg(
-        &mut admin_ws,
-        &ClientToRelay::SendMlsMessage {
-            epoch: admin_mls.current_epoch(),
-            message_id: "blocked-msg".into(),
-            ciphertext_b64: STANDARD.encode(&ct),
-        },
-    )
-    .await;
-    match recv_msg(&mut admin_ws).await {
-        RelayToClient::Error { code, .. } => assert_eq!(code, "messaging_paused"),
-        other => panic!("expected messaging_paused error, got {other:?}"),
-    }
-
-    // Admin commits MLS Remove for Guest 1 -> Epoch 3 -> messaging unpauses!
-    let (remove_commit, new_epoch) = admin_mls
-        .remove_member_by_participant_id(&g1_mls_id)
+    // Admin stages & sends MLS Remove Commit for Guest 1 -> Epoch 3.
+    let staged_rm = admin_mls
+        .stage_remove_member_by_participant_id(&g1_mls_id)
         .unwrap();
+    let rm_cid = random_token_b64url(10).unwrap();
     send_msg(
         &mut admin_ws,
         &ClientToRelay::SendMlsCommit {
-            epoch: new_epoch,
-            commit_b64: STANDARD.encode(&remove_commit),
+            commit_id: rm_cid.clone(),
+            expected_epoch: staged_rm.expected_epoch,
+            epoch: staged_rm.new_epoch,
+            commit_b64: STANDARD.encode(&staged_rm.commit_bytes),
             removed_participant_id: Some(removed_relay_pid),
         },
     )
     .await;
+
+    // CommitAccepted STILL reports messaging_paused == true until connected members ack Epoch 3!
     assert!(matches!(
         recv_msg(&mut admin_ws).await,
-        RelayToClient::MemberStatus {
-            messaging_paused: false,
+        RelayToClient::CommitAccepted {
+            messaging_paused: true,
+            new_epoch: 3,
             ..
         }
     ));
+    admin_mls.apply_pending_commit().unwrap();
+    send_msg(
+        &mut admin_ws,
+        &ClientToRelay::AckCommit {
+            commit_id: rm_cid.clone(),
+            epoch: 3,
+        },
+    )
+    .await;
 
-    // Guest 2 applies Remove Commit.
-    match recv_msg(&mut g2_ws).await {
-        RelayToClient::MlsCommit { commit_b64, .. } => {
-            g2_mls
-                .process_incoming(&STANDARD.decode(&commit_b64).unwrap())
-                .unwrap();
-        }
-        other => panic!("expected MlsCommit for g2, got {other:?}"),
-    }
-
-    // Admin sends a post-removal message -> Guest 2 decrypts, former Guest 1 CANNOT decrypt!
+    // Even after Admin acked, Guest 2 hasn't acked Epoch 3 yet -> sending MUST STILL be paused!
     let post_payload = ChatAppPayload {
         message_id: "msg-post-remove".into(),
         text: "Confidential after removal".into(),
@@ -530,7 +615,72 @@ async fn full_e2e_mls_flow_removal_blocks_former_guest_and_panic_wipe() {
     send_msg(
         &mut admin_ws,
         &ClientToRelay::SendMlsMessage {
-            epoch: admin_mls.current_epoch(),
+            epoch: 3,
+            message_id: "blocked-before-g2-ack".into(),
+            ciphertext_b64: STANDARD.encode(&post_ct),
+        },
+    )
+    .await;
+    match recv_msg(&mut admin_ws).await {
+        RelayToClient::Error { code, .. } => assert_eq!(code, "messaging_paused"),
+        other => panic!("expected messaging_paused before g2 acks, got {other:?}"),
+    }
+
+    // Guest 2 receives Remove Commit, applies it, and sends AckCommit -> NOW messaging unpauses!
+    match recv_msg(&mut g2_ws).await {
+        RelayToClient::MlsCommit {
+            commit_id,
+            epoch,
+            commit_b64,
+            messaging_paused,
+            ..
+        } => {
+            assert!(messaging_paused);
+            assert_eq!(epoch, 3);
+            g2_mls
+                .process_incoming(&STANDARD.decode(&commit_b64).unwrap())
+                .unwrap();
+            send_msg(&mut g2_ws, &ClientToRelay::AckCommit { commit_id, epoch }).await;
+        }
+        other => panic!("expected MlsCommit for g2, got {other:?}"),
+    }
+
+    // Both Admin and Guest 2 receive unpause MemberStatus!
+    assert!(matches!(
+        recv_msg(&mut admin_ws).await,
+        RelayToClient::MemberStatus {
+            messaging_paused: false,
+            ..
+        }
+    ));
+    assert!(matches!(
+        recv_msg(&mut g2_ws).await,
+        RelayToClient::MemberStatus {
+            messaging_paused: false,
+            ..
+        }
+    ));
+
+    // Stale-epoch send on epoch 2 MUST be rejected by relay!
+    send_msg(
+        &mut g2_ws,
+        &ClientToRelay::SendMlsMessage {
+            epoch: 2,
+            message_id: "stale-epoch-msg".into(),
+            ciphertext_b64: STANDARD.encode(&ct),
+        },
+    )
+    .await;
+    match recv_msg(&mut g2_ws).await {
+        RelayToClient::Error { code, .. } => assert_eq!(code, "epoch_mismatch"),
+        other => panic!("expected epoch_mismatch on stale epoch, got {other:?}"),
+    }
+
+    // Admin sends valid Epoch 3 message -> Guest 2 decrypts, former Guest 1 CANNOT decrypt!
+    send_msg(
+        &mut admin_ws,
+        &ClientToRelay::SendMlsMessage {
+            epoch: 3,
             message_id: "msg-post-remove".into(),
             ciphertext_b64: STANDARD.encode(&post_ct),
         },
@@ -545,7 +695,6 @@ async fn full_e2e_mls_flow_removal_blocks_former_guest_and_panic_wipe() {
         g2_mls.process_incoming(&post_bytes).unwrap(),
         MlsIncomingEvent::ChatMessage { payload: p, .. } if p.text == post_payload.text
     ));
-    // Former Guest 1 MUST fail to decrypt Epoch 3 ciphertext!
     assert!(g1_mls.process_incoming(&post_bytes).is_err());
 
     // Admin triggers Panic-Wipe -> receives confirmation, Guest 2 receives RoomWiped, room is destroyed.
@@ -571,6 +720,592 @@ async fn full_e2e_mls_flow_removal_blocks_former_guest_and_panic_wipe() {
 }
 
 #[tokio::test]
+async fn resume_on_stale_epoch_delivers_ordered_missed_commits_and_blocks_old_epoch_send() {
+    let (url, _) = spawn_test_relay(RelayConfig::default()).await;
+    let (mut admin_ws, room_id, _, _, mut admin_key, mut admin_mls) =
+        create_initialized_room(&url).await;
+    let admin_fp = admin_key.fingerprint();
+
+    // Admit Guest 1 (Epoch 1).
+    let tok1 = register_invite(&mut admin_ws, &mut admin_key, 0).await;
+    let (mut g1_ws, g1_relay_id, _, g1_resume, mut g1_mls) = admit_guest(
+        &url,
+        &room_id,
+        &tok1,
+        &admin_fp,
+        &mut admin_ws,
+        &mut admin_mls,
+    )
+    .await;
+    assert_eq!(g1_mls.current_epoch(), 1);
+
+    // Guest 1 temporarily disconnects.
+    g1_ws.close(None).await.unwrap();
+    assert!(matches!(
+        recv_msg(&mut admin_ws).await,
+        RelayToClient::MemberStatus {
+            connected: false,
+            ..
+        }
+    ));
+
+    // While Guest 1 is offline, Guest 2 joins (Epoch 2) AND leaves + is removed (Epoch 3)!
+    let tok2 = register_invite(&mut admin_ws, &mut admin_key, 1).await;
+    let (mut g2_ws, g2_relay_id, g2_mls_id, _, mut g2_mls) = admit_guest(
+        &url,
+        &room_id,
+        &tok2,
+        &admin_fp,
+        &mut admin_ws,
+        &mut admin_mls,
+    )
+    .await;
+    send_msg(&mut g2_ws, &ClientToRelay::LeaveRoom).await;
+    let _ = recv_msg(&mut admin_ws).await; // MemberRemovalRequired
+    let _ = recv_msg(&mut admin_ws).await; // MemberStatus paused
+
+    let staged_rm = admin_mls
+        .stage_remove_member_by_participant_id(&g2_mls_id)
+        .unwrap();
+    let rm_cid = random_token_b64url(10).unwrap();
+    send_msg(
+        &mut admin_ws,
+        &ClientToRelay::SendMlsCommit {
+            commit_id: rm_cid.clone(),
+            expected_epoch: 2,
+            epoch: 3,
+            commit_b64: STANDARD.encode(&staged_rm.commit_bytes),
+            removed_participant_id: Some(g2_relay_id),
+        },
+    )
+    .await;
+    let _ = recv_msg(&mut admin_ws).await; // CommitAccepted
+    admin_mls.apply_pending_commit().unwrap();
+    send_msg(
+        &mut admin_ws,
+        &ClientToRelay::AckCommit {
+            commit_id: rm_cid,
+            epoch: 3,
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv_msg(&mut admin_ws).await,
+        RelayToClient::MemberStatus {
+            messaging_paused: false,
+            ..
+        }
+    ));
+
+    // Now Guest 1 reconnects at stale Epoch 1!
+    let mut g1_resumed = connect_ws(&url, "https://geistr.pages.dev").await.unwrap();
+    send_msg(
+        &mut g1_resumed,
+        &ClientToRelay::ResumeSession {
+            room_id: room_id.clone(),
+            participant_id: g1_relay_id.clone(),
+            resume_token: g1_resume,
+            resume_attempt_id: "attempt-stale-1".into(),
+            last_epoch: 1,
+        },
+    )
+    .await;
+
+    let (epoch, missed) = match recv_msg(&mut g1_resumed).await {
+        RelayToClient::SessionResumed {
+            epoch,
+            missed_commits,
+            ..
+        } => (epoch, missed_commits),
+        other => panic!("expected SessionResumed, got {other:?}"),
+    };
+    assert_eq!(epoch, 3);
+    assert_eq!(missed.len(), 2);
+    assert_eq!((missed[0].prev_epoch, missed[0].epoch), (1, 2));
+    assert_eq!((missed[1].prev_epoch, missed[1].epoch), (2, 3));
+
+    // Before applying & acking missed commits, Guest 1 CANNOT send messages!
+    let old_ct = g1_mls
+        .encrypt_chat_message(&ChatAppPayload {
+            message_id: "old-m".into(),
+            text: "stale".into(),
+            sent_at_ms: 1000,
+        })
+        .unwrap();
+    send_msg(
+        &mut g1_resumed,
+        &ClientToRelay::SendMlsMessage {
+            epoch: 1,
+            message_id: "old-m".into(),
+            ciphertext_b64: STANDARD.encode(&old_ct),
+        },
+    )
+    .await;
+    match recv_msg(&mut g1_resumed).await {
+        RelayToClient::Error { code, .. } => assert_eq!(code, "epoch_mismatch"),
+        other => panic!("stale client must be blocked from sending, got {other:?}"),
+    }
+
+    // Apply both missed commits in order -> reaches Epoch 3, sends AckCommit, then messaging works
+    // and removed Guest 2 CANNOT decrypt Guest 1's message!
+    let mut last_cid = String::new();
+    for mc in missed {
+        g1_mls
+            .process_incoming(&STANDARD.decode(&mc.commit_b64).unwrap())
+            .unwrap();
+        last_cid = mc.commit_id;
+    }
+    assert_eq!(g1_mls.current_epoch(), 3);
+    send_msg(
+        &mut g1_resumed,
+        &ClientToRelay::AckCommit {
+            commit_id: last_cid,
+            epoch: 3,
+        },
+    )
+    .await;
+    // Drain MemberStatus on admin_ws: first paused when g1 resumed on stale epoch, then unpaused after g1 acked epoch 3!
+    assert!(matches!(
+        recv_msg(&mut admin_ws).await,
+        RelayToClient::MemberStatus {
+            connected: true,
+            messaging_paused: true,
+            ..
+        }
+    ));
+    assert!(matches!(
+        recv_msg(&mut admin_ws).await,
+        RelayToClient::MemberStatus {
+            messaging_paused: false,
+            ..
+        }
+    ));
+
+    let fresh_payload = ChatAppPayload {
+        message_id: "fresh-ep3".into(),
+        text: "After catching up to epoch 3".into(),
+        sent_at_ms: 2000,
+    };
+    let fresh_ct = g1_mls.encrypt_chat_message(&fresh_payload).unwrap();
+    send_msg(
+        &mut g1_resumed,
+        &ClientToRelay::SendMlsMessage {
+            epoch: 3,
+            message_id: "fresh-ep3".into(),
+            ciphertext_b64: STANDARD.encode(&fresh_ct),
+        },
+    )
+    .await;
+
+    let RelayToClient::MlsMessage { ciphertext_b64, .. } = recv_msg(&mut admin_ws).await else {
+        panic!("expected MlsMessage on admin");
+    };
+    let ct_bytes = STANDARD.decode(&ciphertext_b64).unwrap();
+    assert!(matches!(
+        admin_mls.process_incoming(&ct_bytes).unwrap(),
+        MlsIncomingEvent::ChatMessage { payload: p, .. } if p.text == fresh_payload.text
+    ));
+    // Removed Guest 2 MUST NOT decrypt!
+    assert!(g2_mls.process_incoming(&ct_bytes).is_err());
+}
+
+#[tokio::test]
+async fn lost_join_accepted_retries_idempotently_with_same_nonce_and_rejects_expired_complete_join()
+{
+    let start_ms = now_ms();
+    let cfg = RelayConfig {
+        join_reservation_ttl_secs: 10,
+        ..Default::default()
+    };
+    // Run without sweeper to verify synchronous deadline checks inside CompleteJoin!
+    let (url, _, clock) = spawn_test_relay_with_clock(cfg, start_ms, false).await;
+    let (mut admin_ws, room_id, _, _, mut admin_key, mut admin_mls) =
+        create_initialized_room(&url).await;
+    let admin_fp = admin_key.fingerprint();
+    let admin_pk = admin_key.verifying_key_bytes();
+
+    // Case 1: Guest sends JoinRoom, drops socket before receiving JoinAccepted, Admin completes join,
+    // Guest retries with the EXACT same invite token + nonce + KeyPackage -> receives JoinAccepted!
+    let tok1 = register_invite(&mut admin_ws, &mut admin_key, 0).await;
+    let mut guest_mls = MlsSession::new_guest(&room_id, "guest-retry").unwrap();
+    let kp_b64 = STANDARD.encode(guest_mls.generate_key_package().unwrap());
+    let nonce = "retry-nonce-12345";
+
+    let mut g_ws1 = connect_ws(&url, "https://geistr.pages.dev").await.unwrap();
+    send_msg(
+        &mut g_ws1,
+        &ClientToRelay::JoinRoom {
+            room_id: room_id.clone(),
+            invite_token: tok1.clone(),
+            key_package_b64: kp_b64.clone(),
+            client_join_nonce: nonce.into(),
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv_msg(&mut g_ws1).await,
+        RelayToClient::JoinPending { .. }
+    ));
+
+    // Guest loses socket mid-flight BEFORE admin finishes!
+    g_ws1.close(None).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Admin still receives GuestJoinRequest and completes join (reservation preserved across disconnect!).
+    let (res_id, guest_id, req_kp) = match recv_msg(&mut admin_ws).await {
+        RelayToClient::GuestJoinRequest {
+            reservation_id,
+            guest_id,
+            key_package_b64,
+        } => (reservation_id, guest_id, key_package_b64),
+        other => panic!("expected GuestJoinRequest, got {other:?}"),
+    };
+    let staged = admin_mls
+        .stage_add_member(&STANDARD.decode(&req_kp).unwrap())
+        .unwrap();
+    let cid = random_token_b64url(10).unwrap();
+    send_msg(
+        &mut admin_ws,
+        &ClientToRelay::CompleteJoin {
+            reservation_id: res_id,
+            guest_id: guest_id.clone(),
+            commit_id: cid.clone(),
+            expected_epoch: 0,
+            commit_b64: STANDARD.encode(&staged.commit_bytes),
+            welcome_b64: STANDARD.encode(&staged.welcome_bytes),
+            new_epoch: 1,
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv_msg(&mut admin_ws).await,
+        RelayToClient::CommitAccepted { new_epoch: 1, .. }
+    ));
+    admin_mls.apply_pending_commit().unwrap();
+    send_msg(
+        &mut admin_ws,
+        &ClientToRelay::AckCommit {
+            commit_id: cid,
+            epoch: 1,
+        },
+    )
+    .await;
+
+    // Parallel attacker with DIFFERENT nonce is rejected with invite_consumed!
+    let mut attacker = connect_ws(&url, "https://geistr.pages.dev").await.unwrap();
+    send_msg(
+        &mut attacker,
+        &ClientToRelay::JoinRoom {
+            room_id: room_id.clone(),
+            invite_token: tok1.clone(),
+            key_package_b64: kp_b64.clone(),
+            client_join_nonce: "other-nonce-999".into(),
+        },
+    )
+    .await;
+    match recv_msg(&mut attacker).await {
+        RelayToClient::Error { code, .. } => assert_eq!(code, "invite_consumed"),
+        other => panic!("different nonce must be rejected, got {other:?}"),
+    }
+
+    // Real guest retries with EXACT same token + nonce + KeyPackage -> gets cached JoinAccepted!
+    let mut g_ws2 = connect_ws(&url, "https://geistr.pages.dev").await.unwrap();
+    send_msg(
+        &mut g_ws2,
+        &ClientToRelay::JoinRoom {
+            room_id: room_id.clone(),
+            invite_token: tok1,
+            key_package_b64: kp_b64,
+            client_join_nonce: nonce.into(),
+        },
+    )
+    .await;
+    match recv_msg(&mut g_ws2).await {
+        RelayToClient::JoinAccepted {
+            participant_id,
+            welcome_b64,
+            members,
+            ..
+        } => {
+            assert_eq!(participant_id, guest_id);
+            assert_eq!(members.len(), 2, "must occupy exactly 1 guest seat");
+            guest_mls
+                .join_from_welcome(
+                    &STANDARD.decode(&welcome_b64).unwrap(),
+                    &admin_pk,
+                    &admin_fp,
+                )
+                .unwrap();
+        }
+        other => panic!("expected cached JoinAccepted on retry, got {other:?}"),
+    }
+
+    // Case 2: CompleteJoin AFTER reservation TTL expires (without any sweeper tick!) MUST be rejected!
+    let tok2 = register_invite(&mut admin_ws, &mut admin_key, 1).await;
+    let mut g2_ws = connect_ws(&url, "https://geistr.pages.dev").await.unwrap();
+    let kp2 = STANDARD.encode(
+        MlsSession::new_guest(&room_id, "g2-exp")
+            .unwrap()
+            .generate_key_package()
+            .unwrap(),
+    );
+    send_msg(
+        &mut g2_ws,
+        &ClientToRelay::JoinRoom {
+            room_id: room_id.clone(),
+            invite_token: tok2,
+            key_package_b64: kp2,
+            client_join_nonce: "nonce-exp-1".into(),
+        },
+    )
+    .await;
+    let _ = recv_msg(&mut g2_ws).await; // JoinPending
+    let (exp_res_id, exp_gid, exp_kp) = match recv_msg(&mut admin_ws).await {
+        RelayToClient::GuestJoinRequest {
+            reservation_id,
+            guest_id,
+            key_package_b64,
+        } => (reservation_id, guest_id, key_package_b64),
+        other => panic!("expected GuestJoinRequest, got {other:?}"),
+    };
+
+    // Advance controlled clock past the 10s reservation TTL (sweeper is OFF!).
+    clock.fetch_add(15_000, Ordering::SeqCst);
+
+    let staged_late = admin_mls
+        .stage_add_member(&STANDARD.decode(&exp_kp).unwrap())
+        .unwrap();
+    send_msg(
+        &mut admin_ws,
+        &ClientToRelay::CompleteJoin {
+            reservation_id: exp_res_id,
+            guest_id: exp_gid,
+            commit_id: "late-commit".into(),
+            expected_epoch: 1,
+            commit_b64: STANDARD.encode(&staged_late.commit_bytes),
+            welcome_b64: STANDARD.encode(&staged_late.welcome_bytes),
+            new_epoch: 2,
+        },
+    )
+    .await;
+    match recv_msg(&mut admin_ws).await {
+        RelayToClient::Error { code, .. } => assert_eq!(code, "reservation_expired"),
+        other => panic!("expired reservation CompleteJoin must fail, got {other:?}"),
+    }
+    admin_mls.clear_pending_commit();
+}
+
+#[tokio::test]
+async fn resume_retry_is_idempotent_and_superseded_socket_cannot_submit_frames() {
+    let (url, _) = spawn_test_relay(RelayConfig::default()).await;
+    let (mut admin_ws, room_id, _, _, mut admin_key, mut admin_mls) =
+        create_initialized_room(&url).await;
+    let admin_fp = admin_key.fingerprint();
+
+    let tok1 = register_invite(&mut admin_ws, &mut admin_key, 0).await;
+    let (mut g1_old, g1_relay_id, _, g1_resume_tok, mut g1_mls) = admit_guest(
+        &url,
+        &room_id,
+        &tok1,
+        &admin_fp,
+        &mut admin_ws,
+        &mut admin_mls,
+    )
+    .await;
+
+    // 1. Overlapping socket resumes while g1_old is STILL open!
+    let mut g1_new1 = connect_ws(&url, "https://geistr.pages.dev").await.unwrap();
+    send_msg(
+        &mut g1_new1,
+        &ClientToRelay::ResumeSession {
+            room_id: room_id.clone(),
+            participant_id: g1_relay_id.clone(),
+            resume_token: g1_resume_tok.clone(),
+            resume_attempt_id: "attempt-idemp-1".into(),
+            last_epoch: 1,
+        },
+    )
+    .await;
+    let rotated_tok1 = match recv_msg(&mut g1_new1).await {
+        RelayToClient::SessionResumed { resume_token, .. } => resume_token,
+        other => panic!("expected SessionResumed, got {other:?}"),
+    };
+    let _ = recv_msg(&mut admin_ws).await; // MemberStatus
+
+    // Old superseded socket tries to send a message -> MUST be rejected or closed, never forwarded!
+    let ct = g1_mls
+        .encrypt_chat_message(&ChatAppPayload {
+            message_id: "from-old-sock".into(),
+            text: "should not pass".into(),
+            sent_at_ms: 1000,
+        })
+        .unwrap();
+    let _ = send_msg(
+        &mut g1_old,
+        &ClientToRelay::SendMlsMessage {
+            epoch: 1,
+            message_id: "from-old-sock".into(),
+            ciphertext_b64: STANDARD.encode(&ct),
+        },
+    )
+    .await;
+    // Admin must NOT receive the frame from the superseded socket.
+    let admin_got = tokio::time::timeout(Duration::from_millis(200), admin_ws.next()).await;
+    assert!(
+        admin_got.is_err(),
+        "admin must not receive message from superseded socket"
+    );
+
+    // 2. Suppose SessionResumed on g1_new1 was lost in flight (no AckResume sent).
+    // Client retries with the SAME old resume_token AND SAME resume_attempt_id -> succeeds idempotently!
+    let mut g1_new2 = connect_ws(&url, "https://geistr.pages.dev").await.unwrap();
+    send_msg(
+        &mut g1_new2,
+        &ClientToRelay::ResumeSession {
+            room_id: room_id.clone(),
+            participant_id: g1_relay_id.clone(),
+            resume_token: g1_resume_tok.clone(),
+            resume_attempt_id: "attempt-idemp-1".into(),
+            last_epoch: 1,
+        },
+    )
+    .await;
+    let rotated_tok2 = match recv_msg(&mut g1_new2).await {
+        RelayToClient::SessionResumed { resume_token, .. } => resume_token,
+        other => panic!("expected idempotent SessionResumed, got {other:?}"),
+    };
+    assert_eq!(rotated_tok1, rotated_tok2);
+
+    // Once client sends AckResume, the old token is permanently retired!
+    send_msg(&mut g1_new2, &ClientToRelay::AckResume).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let mut g1_replay = connect_ws(&url, "https://geistr.pages.dev").await.unwrap();
+    send_msg(
+        &mut g1_replay,
+        &ClientToRelay::ResumeSession {
+            room_id,
+            participant_id: g1_relay_id,
+            resume_token: g1_resume_tok,
+            resume_attempt_id: "attempt-idemp-1".into(),
+            last_epoch: 1,
+        },
+    )
+    .await;
+    match recv_msg(&mut g1_replay).await {
+        RelayToClient::Error { code, .. } => assert_eq!(code, "invalid_resume_token"),
+        other => panic!("retired resume token must fail, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn expired_room_cannot_be_resurrected_before_sweep_and_stale_admin_cmd_rejected() {
+    let start_ms = now_ms();
+    // Sweeper disabled so we prove hard expiry is enforced synchronously BEFORE any sweep!
+    let (url, state, clock) =
+        spawn_test_relay_with_clock(RelayConfig::default(), start_ms, false).await;
+    let (mut admin_ws, room_id, _, _, mut admin_key, mut admin_mls) =
+        create_initialized_room(&url).await;
+    let admin_fp = admin_key.fingerprint();
+
+    // Advance room to Epoch 1 by admitting a guest.
+    let tok1 = register_invite(&mut admin_ws, &mut admin_key, 0).await;
+    let (mut g1_ws, _, _, _, _) = admit_guest(
+        &url,
+        &room_id,
+        &tok1,
+        &admin_fp,
+        &mut admin_ws,
+        &mut admin_mls,
+    )
+    .await;
+
+    // 1. Live AdminCommand signed for stale epoch 0 while room is at epoch 1 MUST be rejected!
+    let stale_policy_cmd = admin_key
+        .sign_command(
+            0,
+            AdminCommandPayload::SetPolicy {
+                msg_ttl_secs: 300,
+                room_ttl_secs: 300,
+            },
+        )
+        .unwrap();
+    send_msg(
+        &mut admin_ws,
+        &ClientToRelay::AdminCommand {
+            signed_cmd: stale_policy_cmd,
+        },
+    )
+    .await;
+    match recv_msg(&mut admin_ws).await {
+        RelayToClient::Error { code, .. } => assert_eq!(code, "invalid_admin_command"),
+        other => panic!("stale-epoch live admin command must fail, got {other:?}"),
+    }
+
+    // 2. VerifySession succeeds while active & synced!
+    send_msg(
+        &mut g1_ws,
+        &ClientToRelay::VerifySession {
+            check_id: "vis-1".into(),
+            local_epoch: 1,
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv_msg(&mut g1_ws).await,
+        RelayToClient::SessionVerified { epoch: 1, .. }
+    ));
+
+    // 3. Shorten room TTL to 5m (300s), then advance controlled clock by 301s WITHOUT running sweep!
+    let shorten_cmd = admin_key
+        .sign_command(
+            1,
+            AdminCommandPayload::SetPolicy {
+                msg_ttl_secs: 300,
+                room_ttl_secs: 300,
+            },
+        )
+        .unwrap();
+    send_msg(
+        &mut admin_ws,
+        &ClientToRelay::AdminCommand {
+            signed_cmd: shorten_cmd,
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv_msg(&mut admin_ws).await,
+        RelayToClient::PolicyUpdated { .. }
+    ));
+
+    // Advance past 5m hard deadline!
+    clock.fetch_add(301_000, Ordering::SeqCst);
+
+    // Admin tries to extend room TTL back to 1h (3600s) before sweeper runs -> MUST FAIL and close room!
+    let resurrect_cmd = admin_key
+        .sign_command(
+            1,
+            AdminCommandPayload::SetPolicy {
+                msg_ttl_secs: 300,
+                room_ttl_secs: 3600,
+            },
+        )
+        .unwrap();
+    send_msg(
+        &mut admin_ws,
+        &ClientToRelay::AdminCommand {
+            signed_cmd: resurrect_cmd,
+        },
+    )
+    .await;
+    match recv_msg(&mut admin_ws).await {
+        RelayToClient::RoomClosed { .. } | RelayToClient::Error { .. } => {}
+        other => panic!("expired room must close instead of resurrecting, got {other:?}"),
+    }
+    assert_eq!(state.active_room_count().await, 0);
+}
+
+#[tokio::test]
 async fn last_socket_disconnect_immediately_destroys_room_and_invalidates_resume() {
     let (url, state) = spawn_test_relay(RelayConfig::default()).await;
     let (mut admin_ws, room_id, admin_id, resume_token, _, _) = create_initialized_room(&url).await;
@@ -589,6 +1324,8 @@ async fn last_socket_disconnect_immediately_destroys_room_and_invalidates_resume
             room_id,
             participant_id: admin_id,
             resume_token,
+            resume_attempt_id: "attempt-after-close".into(),
+            last_epoch: 0,
         },
     )
     .await;
@@ -610,7 +1347,7 @@ async fn guest_reconnect_within_grace_succeeds_and_expiry_triggers_removal() {
     let admin_fp = admin_key.fingerprint();
 
     let tok1 = register_invite(&mut admin_ws, &mut admin_key, 0).await;
-    let (mut g1_ws, _, g1_resume, _) = admit_guest(
+    let (mut g1_ws, g1_relay_id, _, g1_resume, _) = admit_guest(
         &url,
         &room_id,
         &tok1,
@@ -620,16 +1357,14 @@ async fn guest_reconnect_within_grace_succeeds_and_expiry_triggers_removal() {
     )
     .await;
 
-    // Fetch guest's relay participant_id from the member list by disconnecting and reading MemberStatus.
     g1_ws.close(None).await.unwrap();
-    let g1_relay_id = match recv_msg(&mut admin_ws).await {
+    assert!(matches!(
+        recv_msg(&mut admin_ws).await,
         RelayToClient::MemberStatus {
-            participant_id,
             connected: false,
             ..
-        } => participant_id,
-        other => panic!("expected MemberStatus disconnected, got {other:?}"),
-    };
+        }
+    ));
 
     // Resume BEFORE 1s grace window expires -> succeeds!
     let mut g1_resumed = connect_ws(&url, "https://geistr.pages.dev").await.unwrap();
@@ -639,6 +1374,8 @@ async fn guest_reconnect_within_grace_succeeds_and_expiry_triggers_removal() {
             room_id: room_id.clone(),
             participant_id: g1_relay_id.clone(),
             resume_token: g1_resume,
+            resume_attempt_id: "attempt-grace-1".into(),
+            last_epoch: 1,
         },
     )
     .await;
@@ -654,7 +1391,7 @@ async fn guest_reconnect_within_grace_succeeds_and_expiry_triggers_removal() {
         }
     ));
 
-    // Now disconnect again and let the 1s grace window expire -> Admin receives MemberRemovalRequired!
+    // Disconnect again and let 1s grace window expire -> Admin receives MemberRemovalRequired!
     g1_resumed.close(None).await.unwrap();
     assert!(matches!(
         recv_msg(&mut admin_ws).await,
@@ -670,4 +1407,74 @@ async fn guest_reconnect_within_grace_succeeds_and_expiry_triggers_removal() {
         }
         other => panic!("expected MemberRemovalRequired after grace expiry, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn slow_consumer_budget_overflow_terminates_only_slow_socket_while_others_continue() {
+    // Outbound byte budget large enough for join handshake (~4 KiB) but small enough that
+    // blasting chat messages overflows the slow guest's socket while admin stays alive.
+    let cfg = RelayConfig {
+        max_outbound_bytes_per_min: 10_240,
+        ..Default::default()
+    };
+    let (url, _) = spawn_test_relay(cfg).await;
+    let (mut admin_ws, room_id, _, _, mut admin_key, mut admin_mls) =
+        create_initialized_room(&url).await;
+    let admin_fp = admin_key.fingerprint();
+
+    let tok1 = register_invite(&mut admin_ws, &mut admin_key, 0).await;
+    let (_slow_g1, g1_relay_id, _, _, _) = admit_guest(
+        &url,
+        &room_id,
+        &tok1,
+        &admin_fp,
+        &mut admin_ws,
+        &mut admin_mls,
+    )
+    .await;
+
+    // Blast messages from admin until slow_g1 overflows its outbound byte budget -> relay closes slow_g1
+    // out-of-band and notifies admin that g1 disconnected, while admin's own socket stays alive!
+    let mut saw_g1_disconnect = false;
+    for i in 0..40 {
+        let ct = admin_mls
+            .encrypt_chat_message(&ChatAppPayload {
+                message_id: format!("flood-{i}"),
+                text: "x".repeat(1200),
+                sent_at_ms: 1000 + i,
+            })
+            .unwrap();
+        send_msg(
+            &mut admin_ws,
+            &ClientToRelay::SendMlsMessage {
+                epoch: 1,
+                message_id: format!("flood-{i}"),
+                ciphertext_b64: STANDARD.encode(&ct),
+            },
+        )
+        .await;
+        if let Ok(Some(Ok(Message::Text(t)))) =
+            tokio::time::timeout(Duration::from_millis(40), admin_ws.next()).await
+            && let Ok(RelayToClient::MemberStatus {
+                participant_id,
+                connected: false,
+                ..
+            }) = serde_json::from_str::<RelayToClient>(&t)
+            && participant_id == g1_relay_id
+        {
+            saw_g1_disconnect = true;
+            break;
+        }
+    }
+    assert!(
+        saw_g1_disconnect,
+        "slow/overflowing consumer must be aborted out-of-band so reader exits and triggers disconnect"
+    );
+
+    // Admin socket is still alive and responds to Ping!
+    send_msg(&mut admin_ws, &ClientToRelay::Ping { ts_ms: 42 }).await;
+    assert!(matches!(
+        recv_msg(&mut admin_ws).await,
+        RelayToClient::Pong { ts_ms: 42 }
+    ));
 }

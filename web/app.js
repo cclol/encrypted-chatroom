@@ -50,7 +50,7 @@ function defaultRelayUrl() {
     return "ws://127.0.0.1:8080/ws";
   }
   const meta = document.querySelector('meta[name="geistr-relay-url"]');
-  return meta ? meta.getAttribute("content") : "wss://geistr-relay.koyeb.app/ws";
+  return meta ? meta.getAttribute("content") : "wss://geistr-relay.onrender.com/ws";
 }
 
 // Section 4: Read invite fragment early and immediately strip it from the visible URL.
@@ -70,7 +70,8 @@ function extractAndStripInviteFragment() {
   return null;
 }
 
-const pendingInvite = extractAndStripInviteFragment();
+// Mutable so invite credentials are released immediately after handoff to the Worker (Finding 7).
+let pendingInvite = extractAndStripInviteFragment();
 els.relayUrlInput.value = (pendingInvite && pendingInvite.relayOverride) || defaultRelayUrl();
 
 let currentState = {
@@ -79,6 +80,11 @@ let currentState = {
   roomExpiresAtMs: 0,
   messagingPaused: false,
 };
+
+// Monotonic visibility token ensures stale pre-hide render frames can NEVER flash on return (Finding 6).
+let visibilityToken = 0;
+let visibilityShieldLocked = false;
+let countdownTimerId = null;
 
 const worker = new Worker("./worker.js", { type: "module" });
 
@@ -92,6 +98,33 @@ function clearVisibleMessagesDom() {
   }
   els.inviteLinkOutput.value = "";
   els.inviteOutputBox.classList.add("hidden");
+}
+
+function updateCountdownTimerState() {
+  const shouldRun =
+    currentState.phase === "active" && !document.hidden && !visibilityShieldLocked;
+  if (shouldRun && countdownTimerId === null) {
+    countdownTimerId = window.setInterval(tickCountdowns, 1000);
+  } else if (!shouldRun && countdownTimerId !== null) {
+    window.clearInterval(countdownTimerId);
+    countdownTimerId = null;
+  }
+}
+
+function tickCountdowns() {
+  if (currentState.phase !== "active" || document.hidden || visibilityShieldLocked) {
+    updateCountdownTimerState();
+    return;
+  }
+  if (currentState.roomExpiresAtMs > 0) {
+    els.metaRoomCountdown.textContent = formatCountdown(currentState.roomExpiresAtMs);
+  }
+  for (const node of els.messageList.querySelectorAll(".msg-exp")) {
+    const ts = Number(node.dataset.expiresAt || "0");
+    if (ts > 0) {
+      node.textContent = formatCountdown(ts) + " left";
+    }
+  }
 }
 
 function showError(msg) {
@@ -124,6 +157,7 @@ function showOnlyView(viewName) {
   els.pendingView.classList.toggle("hidden", viewName !== "pending");
   els.chatView.classList.toggle("hidden", viewName !== "chat");
   els.endedView.classList.toggle("hidden", viewName !== "ended");
+  updateCountdownTimerState();
 }
 
 function renderMembers(members, isAdmin) {
@@ -159,37 +193,78 @@ function renderMembers(members, isAdmin) {
   }
 }
 
+function buildMessageElement(m) {
+  const li = document.createElement("li");
+  li.className = "message-item " + (m.is_self ? "self" : "peer");
+  li.dataset.messageId = m.message_id;
+
+  const hdr = document.createElement("div");
+  hdr.className = "msg-header";
+  const who = document.createElement("span");
+  who.textContent = m.is_self
+    ? "You"
+    : `${m.is_admin ? "Admin" : "Guest"} ${m.sender_id.slice(0, 6)}`;
+  const exp = document.createElement("span");
+  exp.className = "msg-exp mono";
+  exp.dataset.expiresAt = String(m.expires_at_ms);
+  exp.textContent = formatCountdown(m.expires_at_ms) + " left";
+  hdr.appendChild(who);
+  hdr.appendChild(exp);
+
+  const body = document.createElement("p");
+  body.className = "msg-text";
+  body.textContent = m.text;
+
+  li.appendChild(hdr);
+  li.appendChild(body);
+  return li;
+}
+
+function scrollMessagesToBottom() {
+  const container = els.messageList.parentElement;
+  if (container) container.scrollTop = container.scrollHeight;
+}
+
 function renderMessages(messages) {
   while (els.messageList.firstChild) {
     els.messageList.removeChild(els.messageList.firstChild);
   }
+  const frag = document.createDocumentFragment();
   for (const m of messages) {
-    const li = document.createElement("li");
-    li.className = "message-item " + (m.is_self ? "self" : "peer");
-
-    const hdr = document.createElement("div");
-    hdr.className = "msg-header";
-    const who = document.createElement("span");
-    who.textContent = m.is_self
-      ? "You"
-      : `${m.is_admin ? "Admin" : "Guest"} ${m.sender_id.slice(0, 6)}`;
-    const exp = document.createElement("span");
-    exp.className = "msg-exp mono";
-    exp.dataset.expiresAt = String(m.expires_at_ms);
-    exp.textContent = formatCountdown(m.expires_at_ms) + " left";
-    hdr.appendChild(who);
-    hdr.appendChild(exp);
-
-    const body = document.createElement("p");
-    body.className = "msg-text";
-    body.textContent = m.text;
-
-    li.appendChild(hdr);
-    li.appendChild(body);
-    els.messageList.appendChild(li);
+    frag.appendChild(buildMessageElement(m));
   }
-  const container = els.messageList.parentElement;
-  if (container) container.scrollTop = container.scrollHeight;
+  els.messageList.appendChild(frag);
+  scrollMessagesToBottom();
+}
+
+function appendMessageIncremental(m) {
+  if (!m || !m.message_id) return;
+  for (const node of els.messageList.children) {
+    if (node.dataset.messageId === m.message_id) return;
+  }
+  els.messageList.appendChild(buildMessageElement(m));
+  scrollMessagesToBottom();
+}
+
+function removeMessagesIncremental(ids) {
+  if (!ids || ids.length === 0) return;
+  const idSet = new Set(ids);
+  for (let node = els.messageList.firstChild; node; ) {
+    const next = node.nextSibling;
+    if (node.dataset && idSet.has(node.dataset.messageId)) {
+      els.messageList.removeChild(node);
+    }
+    node = next;
+  }
+}
+
+function canAcceptRenderMessage(msg) {
+  return (
+    !document.hidden &&
+    !visibilityShieldLocked &&
+    currentState.phase === "active" &&
+    msg.visibility_token === visibilityToken
+  );
 }
 
 worker.addEventListener("message", (ev) => {
@@ -204,13 +279,19 @@ worker.addEventListener("message", (ev) => {
     case "worker_ready":
       els.statusLine.textContent = "Ready (WASM worker active)";
       if (pendingInvite) {
+        const invite = pendingInvite;
+        pendingInvite = null;
         sendWorker({
           type: "join_room",
           relay_url: els.relayUrlInput.value.trim(),
-          room_id: pendingInvite.roomId,
-          invite_token: pendingInvite.token,
-          admin_fingerprint: pendingInvite.fp,
+          room_id: invite.roomId,
+          invite_token: invite.token,
+          admin_fingerprint: invite.fp,
         });
+        invite.roomId = null;
+        invite.token = null;
+        invite.fp = null;
+        invite.relayOverride = null;
       }
       break;
 
@@ -224,15 +305,38 @@ worker.addEventListener("message", (ev) => {
 
     case "clear_display":
       clearVisibleMessagesDom();
-      if (currentState.phase === "reconnecting" || document.hidden) {
+      if (currentState.phase === "reconnecting" || document.hidden || visibilityShieldLocked) {
         els.shieldReason.textContent = msg.reason || "History hidden.";
         showOnlyView("shield");
       }
       break;
 
+    case "visibility_verified":
+      if (
+        !document.hidden &&
+        currentState.phase === "active" &&
+        msg.visibility_token === visibilityToken
+      ) {
+        visibilityShieldLocked = false;
+        showOnlyView("chat");
+      }
+      break;
+
     case "render_history":
-      if (!document.hidden && currentState.phase === "active") {
+      if (canAcceptRenderMessage(msg)) {
         renderMessages(msg.messages || []);
+      }
+      break;
+
+    case "append_message":
+      if (canAcceptRenderMessage(msg)) {
+        appendMessageIncremental(msg.message);
+      }
+      break;
+
+    case "remove_messages":
+      if (canAcceptRenderMessage(msg)) {
+        removeMessagesIncremental(msg.message_ids || []);
       }
       break;
 
@@ -259,12 +363,15 @@ worker.addEventListener("message", (ev) => {
       els.statusLine.textContent = msg.status_text || msg.phase;
 
       if (msg.phase === "idle") {
+        visibilityShieldLocked = false;
         clearVisibleMessagesDom();
         showOnlyView("landing");
       } else if (msg.phase === "connecting" || msg.phase === "pending_join") {
+        visibilityShieldLocked = false;
         els.pendingText.textContent = msg.status_text;
         showOnlyView("pending");
       } else if (msg.phase === "reconnecting") {
+        visibilityShieldLocked = true;
         clearVisibleMessagesDom();
         els.shieldReason.textContent = msg.status_text;
         showOnlyView("shield");
@@ -281,23 +388,32 @@ worker.addEventListener("message", (ev) => {
         els.messageInput.disabled = Boolean(msg.messaging_paused);
         els.btnSend.disabled = Boolean(msg.messaging_paused);
         renderMembers(msg.members || [], isAdmin);
-        if (document.hidden) {
+        if (document.hidden || visibilityShieldLocked) {
           clearVisibleMessagesDom();
           showOnlyView("shield");
         } else {
           showOnlyView("chat");
         }
       } else if (msg.phase === "wiped_local") {
+        visibilityShieldLocked = false;
         clearVisibleMessagesDom();
         els.endedTitle.textContent = "Cleared locally (Panic-Wipe)";
         els.endedReason.textContent = msg.status_text;
         showOnlyView("ended");
       } else if (msg.phase === "wiped_confirmed") {
+        visibilityShieldLocked = false;
         clearVisibleMessagesDom();
         els.endedTitle.textContent = "Room closure confirmed by relay";
         els.endedReason.textContent = msg.status_text;
         showOnlyView("ended");
+      } else if (msg.phase === "wiped_unconfirmed") {
+        visibilityShieldLocked = false;
+        clearVisibleMessagesDom();
+        els.endedTitle.textContent = "Cleared locally — room closure unconfirmed";
+        els.endedReason.textContent = msg.status_text;
+        showOnlyView("ended");
       } else if (msg.phase === "ended") {
+        visibilityShieldLocked = false;
         clearVisibleMessagesDom();
         els.endedTitle.textContent = "Chat room ended";
         els.endedReason.textContent = msg.status_text;
@@ -311,15 +427,18 @@ worker.addEventListener("message", (ev) => {
   }
 });
 
-// Section 6: Immediately clear visible DOM & hide chat on tab switch / app switch / phone lock.
+// Section 6: Immediately clear visible DOM & lock shield on tab switch / app switch / phone lock.
 function handleVisibilityHidden() {
+  visibilityToken += 1;
   if (currentState.phase === "active" || currentState.phase === "reconnecting") {
+    visibilityShieldLocked = true;
     clearVisibleMessagesDom();
     els.messageInput.value = "";
     els.shieldReason.textContent =
-      "Tab or app hidden. Deadlines and membership will be re-verified when you return.";
+      "Tab or app hidden. Deadlines, membership, and MLS epoch will be re-verified when you return.";
     showOnlyView("shield");
   }
+  updateCountdownTimerState();
   sendWorker({ type: "ui_hidden" });
 }
 
@@ -327,30 +446,22 @@ document.addEventListener("visibilitychange", () => {
   if (document.hidden) {
     handleVisibilityHidden();
   } else {
-    sendWorker({ type: "ui_visible" });
-    if (currentState.phase === "active") {
-      showOnlyView("chat");
+    visibilityToken += 1;
+    if (currentState.phase === "active" || currentState.phase === "reconnecting") {
+      // Keep the shield UP and DOM empty until Worker confirms fresh relay verification!
+      visibilityShieldLocked = true;
+      clearVisibleMessagesDom();
+      els.shieldReason.textContent =
+        "Verifying room status, deadlines, and MLS epoch with relay...";
+      showOnlyView("shield");
     }
+    sendWorker({ type: "ui_visible", visibility_token: visibilityToken });
   }
 });
 
 window.addEventListener("pagehide", () => {
   handleVisibilityHidden();
 });
-
-// Countdown display tick (purely cosmetic; authoritative enforcement happens inside WASM Worker & Relay).
-window.setInterval(() => {
-  if (currentState.phase !== "active" || document.hidden) return;
-  if (currentState.roomExpiresAtMs > 0) {
-    els.metaRoomCountdown.textContent = formatCountdown(currentState.roomExpiresAtMs);
-  }
-  for (const node of els.messageList.querySelectorAll(".msg-exp")) {
-    const ts = Number(node.dataset.expiresAt || "0");
-    if (ts > 0) {
-      node.textContent = formatCountdown(ts) + " left";
-    }
-  }
-}, 1000);
 
 // UI event handlers
 els.btnCreateRoom.addEventListener("click", () => {

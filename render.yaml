@@ -1,0 +1,33 @@
+services:
+  - type: web
+    name: geistr-relay
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    region: frankfurt
+    plan: free
+    healthCheckPath: /healthz
+    envVars:
+      - key: BIND_ADDR
+        value: 0.0.0.0
+      - key: ALLOWED_ORIGIN
+        value: https://geistr.pages.dev
+      - key: ALLOW_LOCALHOST_DEV
+        value: "false"
+      - key: INVITE_TTL_SECS
+        value: "300"
+      - key: KEEPALIVE_INTERVAL_SECS
+        value: "20"
+      - key: KEEPALIVE_TIMEOUT_SECS
+        value: "15"
+      - key: MAX_CONCURRENT_ROOMS
+        value: "256"
+      - key: MAX_CONNECTIONS_PER_IP
+        value: "16"
+      - key: MAX_CONNECT_RATE_PER_IP_PER_MIN
+        value: "60"
+      - key: MAX_FRAME_BYTES
+        value: "32768"
+      - key: MAX_OUTBOUND_QUEUE
+        value: "64"
+      - key: MAX_OUTBOUND_BYTES_PER_MIN
+        value: "1048576"

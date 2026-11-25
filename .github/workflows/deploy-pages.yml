@@ -4,67 +4,105 @@ on:
   workflow_dispatch:
     inputs:
       relay_wss_url:
-        description: "Production Koyeb Relay WSS URL (e.g. wss://geistr-relay.koyeb.app/ws)"
+        description: "Production Relay WSS URL (e.g. wss://geistr-relay.onrender.com/ws or wss://geistr-relay.koyeb.app/ws)"
         required: true
+        type: string
+      commit_sha:
+        description: "Exact 40-char commit SHA on main with a green CI run (defaults to triggering ref SHA)"
+        required: false
+        type: string
+      pages_url:
+        description: "Live Cloudflare Pages URL to verify headers after deploy (optional)"
+        required: false
+        default: "https://geistr.pages.dev"
         type: string
 
 permissions:
   contents: read
+  actions: read
   deployments: write
 
 jobs:
   deploy-pages:
-    name: Build & Deploy geistr to Cloudflare Pages
+    name: Deploy verified CI artifact to Cloudflare Pages
     runs-on: ubuntu-latest
-    # Protect production deployments with GitHub Environment approval rules (Section 8).
+    # Protect production deployments with GitHub Environment approval rules & protected branch main.
     environment: production
     steps:
-      - uses: actions/checkout@v4
+      - name: Resolve and verify target commit is on main with green CI
+        id: verify_ci
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          INPUT_SHA: ${{ inputs.commit_sha }}
+          DEFAULT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          TARGET_SHA="${INPUT_SHA:-$DEFAULT_SHA}"
+          if [[ ! "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "ERROR: commit_sha must be a full 40-char lowercase hex SHA, got: $TARGET_SHA" >&2
+            exit 1
+          fi
 
-      - name: Install Rust toolchain with wasm32 target
-        uses: dtolnay/rust-toolchain@stable
+          # 1. Verify TARGET_SHA is reachable from protected main branch.
+          COMPARE_STATUS=$(gh api "repos/${REPO}/compare/${TARGET_SHA}...main" --jq '.status')
+          if [[ "$COMPARE_STATUS" != "ahead" && "$COMPARE_STATUS" != "identical" ]]; then
+            echo "ERROR: commit ${TARGET_SHA} is not on main (status=${COMPARE_STATUS})" >&2
+            exit 1
+          fi
+
+          # 2. Require a completed, successful CI workflow run for this EXACT commit SHA.
+          RUN_ID=$(gh api "repos/${REPO}/actions/workflows/ci.yml/runs?head_sha=${TARGET_SHA}&status=completed&per_page=20" \
+            --jq '[.workflow_runs[] | select(.conclusion == "success")][0].id // empty')
+          if [[ -z "$RUN_ID" ]]; then
+            echo "ERROR: No green CI run found for commit ${TARGET_SHA}. Refusing to deploy." >&2
+            exit 1
+          fi
+
+          echo "Verified green CI run ${RUN_ID} for main commit ${TARGET_SHA}"
+          echo "target_sha=${TARGET_SHA}" >> "$GITHUB_OUTPUT"
+          echo "ci_run_id=${RUN_ID}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout verified commit (deploy scripts only)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          targets: wasm32-unknown-unknown
+          ref: ${{ steps.verify_ci.outputs.target_sha }}
 
-      - name: Cache Cargo
-        uses: Swatinem/rust-cache@v2
+      - name: Download verified geistr-web-dist artifact from green CI run
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          rm -rf dist-web
+          gh run download "${{ steps.verify_ci.outputs.ci_run_id }}" \
+            --repo "${{ github.repository }}" \
+            --name geistr-web-dist \
+            --dir dist-web
+          test -f dist-web/index.html
+          test -f dist-web/_headers
+          test -f dist-web/worker.js
+          test -f dist-web/pkg/web_client_bg.wasm
 
-      - name: Build WASM release bundle
-        run: cargo build --release --target wasm32-unknown-unknown -p web-client
-
-      - name: Install wasm-bindgen-cli
-        run: cargo install wasm-bindgen-cli --version 0.2.130 --locked
-
-      - name: Generate web/pkg bindings
-        run: wasm-bindgen --target web --no-typescript --out-dir web/pkg target/wasm32-unknown-unknown/release/web_client.wasm
-
-      - name: Inject exact production Relay WSS URL into index.html and _headers CSP
+      - name: Validate and inject exact production Relay WSS URL into HTML & CSP
         env:
           RELAY_WSS_URL: ${{ inputs.relay_wss_url }}
         run: |
-          python3 - <<'PY'
-          import os, urllib.parse
-          wss = os.environ["RELAY_WSS_URL"].strip()
-          parsed = urllib.parse.urlparse(wss)
-          assert parsed.scheme == "wss" and parsed.netloc, f"Invalid wss URL: {wss}"
-          wss_origin = f"wss://{parsed.netloc}"
+          set -euo pipefail
+          python3 scripts/configure_pages_origin.py --self-test
+          python3 scripts/configure_pages_origin.py dist-web "$RELAY_WSS_URL"
 
-          with open("web/index.html", "r", encoding="utf-8") as f:
-              html = f.read()
-          html = html.replace("wss://geistr-relay.koyeb.app/ws", wss)
-          with open("web/index.html", "w", encoding="utf-8") as f:
-              f.write(html)
-
-          with open("web/_headers", "r", encoding="utf-8") as f:
-              headers = f.read()
-          headers = headers.replace("wss://*.koyeb.app", wss_origin)
-          with open("web/_headers", "w", encoding="utf-8") as f:
-              f.write(headers)
-          PY
-
-      - name: Deploy to Cloudflare Pages project "geistr"
-        uses: cloudflare/wrangler-action@v3
+      - name: Deploy verified artifact to Cloudflare Pages project "geistr"
+        uses: cloudflare/wrangler-action@da0e0dfe58b7a431659754fdf3f186c529afbe65 # v3.14.1
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          command: pages deploy web --project-name=geistr
+          command: pages deploy dist-web --project-name=geistr
+
+      - name: Verify live Pages security headers and exact CSP origin
+        if: ${{ inputs.pages_url != '' }}
+        env:
+          PAGES_URL: ${{ inputs.pages_url }}
+          RELAY_WSS_URL: ${{ inputs.relay_wss_url }}
+        run: |
+          set -euo pipefail
+          python3 scripts/verify_pages_headers.py "$PAGES_URL" "$RELAY_WSS_URL"
