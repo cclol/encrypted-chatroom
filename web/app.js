@@ -1,15 +1,28 @@
-// Minimal vanilla JS browser entry, UI binding, visibility shield, and Worker bridge.
+// Minimal vanilla JS browser entry, mobile viewport & scroll management, visibility shield, and Worker bridge.
 // All MLS cryptography, WebSocket protocol, ephemeral RAM history, and timers run in the Rust/WASM Worker.
 
 const els = {
+  appTopbar: document.getElementById("app-topbar"),
   statusLine: document.getElementById("status-line"),
+  unsupportedView: document.getElementById("unsupported-view"),
+  unsupportedTitle: document.getElementById("unsupported-title"),
+  unsupportedSummary: document.getElementById("unsupported-summary"),
+  unsupportedNextStep: document.getElementById("unsupported-next-step"),
+  unsupportedDetail: document.getElementById("unsupported-detail"),
   shieldView: document.getElementById("shield-view"),
+  shieldBadge: document.getElementById("shield-badge"),
+  shieldSpinner: document.getElementById("shield-spinner"),
+  shieldTitle: document.getElementById("shield-title"),
   shieldReason: document.getElementById("shield-reason"),
   landingView: document.getElementById("landing-view"),
   pendingView: document.getElementById("pending-view"),
+  pendingBadge: document.getElementById("pending-badge"),
+  pendingTitle: document.getElementById("pending-title"),
   pendingText: document.getElementById("pending-text"),
+  pendingSubhint: document.getElementById("pending-subhint"),
   chatView: document.getElementById("chat-view"),
   endedView: document.getElementById("ended-view"),
+  endedBadge: document.getElementById("ended-badge"),
   endedTitle: document.getElementById("ended-title"),
   endedReason: document.getElementById("ended-reason"),
   errorToast: document.getElementById("error-toast"),
@@ -20,14 +33,19 @@ const els = {
   btnMlsSelftest: document.getElementById("btn-mls-selftest"),
   selftestOutput: document.getElementById("selftest-output"),
   btnCancelJoin: document.getElementById("btn-cancel-join"),
+  btnRoomDrawer: document.getElementById("btn-room-drawer"),
+  roomDrawer: document.getElementById("room-drawer"),
+  chatStatusDot: document.getElementById("chat-status-dot"),
   metaRoomId: document.getElementById("meta-room-id"),
   metaEpoch: document.getElementById("meta-epoch"),
   metaRoomCountdown: document.getElementById("meta-room-countdown"),
   metaMsgTtl: document.getElementById("meta-msg-ttl"),
+  metaMsgTtlPill: document.getElementById("meta-msg-ttl-pill"),
   memberCount: document.getElementById("member-count"),
   memberList: document.getElementById("member-list"),
   adminControls: document.getElementById("admin-controls"),
   btnGenerateInvite: document.getElementById("btn-generate-invite"),
+  btnQuickInvite: document.getElementById("btn-quick-invite"),
   btnPanicWipe: document.getElementById("btn-panic-wipe"),
   inviteOutputBox: document.getElementById("invite-output-box"),
   inviteLinkOutput: document.getElementById("invite-link-output"),
@@ -37,7 +55,10 @@ const els = {
   btnApplyPolicy: document.getElementById("btn-apply-policy"),
   btnLeaveRoom: document.getElementById("btn-leave-room"),
   pauseBanner: document.getElementById("pause-banner"),
+  messagesScroll: document.getElementById("messages-scroll"),
+  emptyChatHint: document.getElementById("empty-chat-hint"),
   messageList: document.getElementById("message-list"),
+  btnNewMessages: document.getElementById("btn-new-messages"),
   composerForm: document.getElementById("composer-form"),
   messageInput: document.getElementById("message-input"),
   btnSend: document.getElementById("btn-send"),
@@ -65,31 +86,81 @@ function extractAndStripInviteFragment() {
   // Remove fragment immediately so it does not linger in the address bar.
   window.history.replaceState(null, "", window.location.pathname);
   if (roomId && token && fp) {
-    return { roomId, token, fp, relayOverride };
+    return { valid: true, roomId, token, fp, relayOverride };
+  }
+  if (roomId || token || fp) {
+    return { valid: false };
   }
   return null;
 }
 
+function checkRuntimeSupport() {
+  if (typeof Worker !== "function") {
+    return { ok: false, reason: "Web Workers are not available in this browser." };
+  }
+  try {
+    if (typeof WebAssembly !== "object" || typeof WebAssembly.instantiate !== "function") {
+      return { ok: false, reason: "WebAssembly is disabled or unsupported." };
+    }
+    // Minimal 8-byte valid WASM module header to catch iPhone Lockdown Mode / JIT blocks synchronously.
+    const probe = new Uint8Array([0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]);
+    const mod = new WebAssembly.Module(probe);
+    if (!(mod instanceof WebAssembly.Module)) {
+      return { ok: false, reason: "WebAssembly compilation is disabled." };
+    }
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, reason: err instanceof Error ? err.message : String(err) };
+  }
+}
+
 // Mutable so invite credentials are released immediately after handoff to the Worker (Finding 7).
 let pendingInvite = extractAndStripInviteFragment();
-els.relayUrlInput.value = (pendingInvite && pendingInvite.relayOverride) || defaultRelayUrl();
+const openedViaInvite = Boolean(pendingInvite && pendingInvite.valid);
+els.relayUrlInput.value =
+  (pendingInvite && pendingInvite.valid && pendingInvite.relayOverride) || defaultRelayUrl();
 
 let currentState = {
   phase: "idle",
   role: null,
   roomExpiresAtMs: 0,
   messagingPaused: false,
+  memberCount: 0,
 };
 
 // Monotonic visibility token ensures stale pre-hide render frames can NEVER flash on return (Finding 6).
 let visibilityToken = 0;
 let visibilityShieldLocked = false;
 let countdownTimerId = null;
+let worker = null;
+let unreadWhileScrolledUp = 0;
+let baseViewportHeight = window.innerHeight || 0;
 
-const worker = new Worker("./worker.js", { type: "module" });
+function clearPendingInviteMemory() {
+  if (!pendingInvite) return;
+  pendingInvite.roomId = null;
+  pendingInvite.token = null;
+  pendingInvite.fp = null;
+  pendingInvite.relayOverride = null;
+  pendingInvite = null;
+}
 
 function sendWorker(cmd) {
+  if (!worker) return;
   worker.postMessage(JSON.stringify(cmd));
+}
+
+function setDrawerOpen(open) {
+  els.roomDrawer.classList.toggle("hidden", !open);
+  els.btnRoomDrawer.setAttribute("aria-expanded", open ? "true" : "false");
+}
+
+function updateEmptyChatHint() {
+  const hasMessages = els.messageList.childElementCount > 0;
+  els.emptyChatHint.classList.toggle("hidden", hasMessages);
+  const showQuickInvite =
+    !hasMessages && currentState.role === "admin" && currentState.memberCount <= 1;
+  els.btnQuickInvite.classList.toggle("hidden", !showQuickInvite);
 }
 
 function clearVisibleMessagesDom() {
@@ -98,6 +169,10 @@ function clearVisibleMessagesDom() {
   }
   els.inviteLinkOutput.value = "";
   els.inviteOutputBox.classList.add("hidden");
+  unreadWhileScrolledUp = 0;
+  els.btnNewMessages.classList.add("hidden");
+  setDrawerOpen(false);
+  updateEmptyChatHint();
 }
 
 function updateCountdownTimerState() {
@@ -152,14 +227,197 @@ function formatCountdown(targetMs) {
 }
 
 function showOnlyView(viewName) {
+  const isChat = viewName === "chat";
+  document.body.classList.toggle("in-chat", isChat);
+  els.unsupportedView.classList.toggle("hidden", viewName !== "unsupported");
   els.shieldView.classList.toggle("hidden", viewName !== "shield");
   els.landingView.classList.toggle("hidden", viewName !== "landing");
   els.pendingView.classList.toggle("hidden", viewName !== "pending");
-  els.chatView.classList.toggle("hidden", viewName !== "chat");
+  els.chatView.classList.toggle("hidden", !isChat);
   els.endedView.classList.toggle("hidden", viewName !== "ended");
+  syncVisualViewport();
   updateCountdownTimerState();
 }
 
+function showUnsupportedBrowser(reasonDetail) {
+  clearPendingInviteMemory();
+  clearVisibleMessagesDom();
+  els.statusLine.textContent = "WebAssembly unavailable";
+  if (openedViaInvite) {
+    els.unsupportedNextStep.textContent =
+      "Your one-time invite link was not consumed. Open the original invite link you received on another compatible device or browser (or allow WebAssembly for this site in Safari Website Settings if you intentionally choose to).";
+  } else {
+    els.unsupportedNextStep.textContent =
+      "Open geistr in a browser with WebAssembly enabled, or use another compatible device. If you received an invite link, open the original link there.";
+  }
+  if (reasonDetail) {
+    els.unsupportedDetail.textContent = `Technical detail: ${reasonDetail}`;
+    els.unsupportedDetail.classList.remove("hidden");
+  } else {
+    els.unsupportedDetail.classList.add("hidden");
+  }
+  showOnlyView("unsupported");
+}
+
+function configureShieldView(kind, reasonText) {
+  els.shieldView.dataset.shieldKind = kind;
+  if (kind === "reconnecting") {
+    els.shieldBadge.textContent = "Reconnecting (60s window)";
+    els.shieldBadge.className = "status-pill pill-warn";
+    els.shieldSpinner.classList.remove("hidden");
+    els.shieldTitle.textContent = "Connection interrupted";
+    els.shieldReason.textContent =
+      reasonText || "Attempting to reconnect within the 60-second grace window. History stays hidden until verified.";
+  } else if (kind === "verifying") {
+    els.shieldBadge.textContent = "Verifying session";
+    els.shieldBadge.className = "status-pill pill-accent";
+    els.shieldSpinner.classList.remove("hidden");
+    els.shieldTitle.textContent = "Checking room status…";
+    els.shieldReason.textContent =
+      reasonText || "Verifying room status, deadlines, and MLS epoch with the relay before showing messages.";
+  } else {
+    els.shieldBadge.textContent = "Session hidden";
+    els.shieldBadge.className = "status-pill";
+    els.shieldSpinner.classList.add("hidden");
+    els.shieldTitle.textContent = "History hidden";
+    els.shieldReason.textContent =
+      reasonText || "Tab or app hidden. Deadlines, membership, and MLS epoch will be re-verified when you return.";
+  }
+}
+
+function configurePendingView(mode, statusText) {
+  if (mode === "waiting_admin") {
+    els.pendingBadge.textContent = "Waiting for admin";
+    els.pendingBadge.className = "status-pill pill-accent";
+    els.pendingTitle.textContent = "Waiting for room admin…";
+    els.pendingText.textContent =
+      statusText || "Admission request sent. Waiting for the admin’s browser to admit you.";
+    els.pendingSubhint.textContent =
+      "Keep this tab open. Admission happens automatically once the admin responds and their cryptographic key is verified.";
+  } else {
+    els.pendingBadge.textContent = openedViaInvite ? "Opening invite link" : "Connecting";
+    els.pendingBadge.className = "status-pill pill-accent";
+    els.pendingTitle.textContent = openedViaInvite ? "Joining room…" : "Connecting to relay…";
+    els.pendingText.textContent =
+      statusText || "Starting end-to-end encryption and contacting the relay.";
+    els.pendingSubhint.textContent =
+      "No group keys are stored in the URL. Your device generates a fresh MLS KeyPackage automatically.";
+  }
+}
+
+function configureEndedView(phase, statusText) {
+  els.endedView.dataset.endedKind = phase;
+  if (phase === "wiped_local") {
+    els.endedBadge.textContent = "Cleared locally · Confirming";
+    els.endedBadge.className = "status-pill pill-warn";
+    els.endedTitle.textContent = "Cleared locally (Panic-Wipe)";
+    els.endedReason.textContent =
+      statusText || "Local RAM history wiped — waiting for relay room-closure confirmation…";
+  } else if (phase === "wiped_confirmed") {
+    els.endedBadge.textContent = "Room closure confirmed by relay";
+    els.endedBadge.className = "status-pill pill-ok";
+    els.endedTitle.textContent = "Room closed & confirmed by relay";
+    els.endedReason.textContent = statusText;
+  } else if (phase === "wiped_unconfirmed") {
+    els.endedBadge.textContent = "Cleared locally · Relay unconfirmed";
+    els.endedBadge.className = "status-pill pill-warn";
+    els.endedTitle.textContent = "Cleared locally — room closure unconfirmed";
+    els.endedReason.textContent = statusText;
+  } else {
+    els.endedBadge.textContent = "Room ended";
+    els.endedBadge.className = "status-pill pill-danger";
+    els.endedTitle.textContent = "Chat room ended";
+    els.endedReason.textContent = statusText || "This ephemeral room has ended.";
+  }
+}
+
+// ===== Mobile Virtual Keyboard & Visual Viewport Handling =====
+function isNearBottom() {
+  const el = els.messagesScroll;
+  if (!el) return true;
+  const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+  return distanceFromBottom <= 56;
+}
+
+function scrollMessagesToBottom() {
+  const el = els.messagesScroll;
+  if (!el) return;
+  el.scrollTop = el.scrollHeight;
+  unreadWhileScrolledUp = 0;
+  els.btnNewMessages.classList.add("hidden");
+}
+
+function syncVisualViewport() {
+  const vv = window.visualViewport;
+  const height = vv ? Math.round(vv.height) : window.innerHeight;
+  const offsetTop = vv ? Math.max(0, Math.round(vv.offsetTop)) : 0;
+
+  if (height > baseViewportHeight || Math.abs(window.innerWidth - (vv ? vv.width : window.innerWidth)) > 100) {
+    baseViewportHeight = Math.max(window.innerHeight || height, height);
+  }
+
+  document.documentElement.style.setProperty("--vvh", `${height}px`);
+  document.documentElement.style.setProperty("--vv-offset-top", `${offsetTop}px`);
+
+  const referenceHeight = Math.max(window.innerHeight || 0, baseViewportHeight);
+  const keyboardLikelyOpen = referenceHeight > 0 && height < referenceHeight * 0.8;
+  const wasNearBottom = isNearBottom();
+  document.body.classList.toggle("keyboard-open", keyboardLikelyOpen);
+
+  if (document.body.classList.contains("in-chat")) {
+    // Collapse drawer automatically if keyboard opens so composer + messages keep full priority.
+    if (keyboardLikelyOpen && !els.roomDrawer.classList.contains("hidden")) {
+      setDrawerOpen(false);
+    }
+    if (wasNearBottom) {
+      window.requestAnimationFrame(scrollMessagesToBottom);
+    }
+  }
+}
+
+if (window.visualViewport) {
+  window.visualViewport.addEventListener("resize", syncVisualViewport);
+  window.visualViewport.addEventListener("scroll", syncVisualViewport);
+}
+window.addEventListener("resize", () => {
+  baseViewportHeight = window.innerHeight || baseViewportHeight;
+  syncVisualViewport();
+});
+window.addEventListener("orientationchange", () => {
+  window.setTimeout(() => {
+    baseViewportHeight = window.innerHeight || baseViewportHeight;
+    syncVisualViewport();
+  }, 150);
+});
+syncVisualViewport();
+
+els.messagesScroll.addEventListener(
+  "scroll",
+  () => {
+    if (isNearBottom() && unreadWhileScrolledUp > 0) {
+      unreadWhileScrolledUp = 0;
+      els.btnNewMessages.classList.add("hidden");
+    }
+  },
+  { passive: true },
+);
+
+els.btnNewMessages.addEventListener("click", () => {
+  scrollMessagesToBottom();
+});
+
+els.messageInput.addEventListener("focus", () => {
+  const wasAtBottom = isNearBottom();
+  setDrawerOpen(false);
+  window.setTimeout(() => {
+    syncVisualViewport();
+    if (wasAtBottom) {
+      scrollMessagesToBottom();
+    }
+  }, 180);
+});
+
+// ===== Rendering =====
 function renderMembers(members, isAdmin) {
   els.memberCount.textContent = String(members.length);
   while (els.memberList.firstChild) {
@@ -169,15 +427,19 @@ function renderMembers(members, isAdmin) {
     const li = document.createElement("li");
     li.className = "member-chip";
 
+    const info = document.createElement("span");
+    info.className = "member-chip-info";
+
     const dot = document.createElement("span");
     dot.className = "dot " + (m.connected ? "online" : "offline");
-    li.appendChild(dot);
+    info.appendChild(dot);
 
     const label = document.createElement("span");
     const roleLabel = m.role === "admin" ? "Admin" : "Guest";
-    const statusLabel = m.connected ? "" : " (disconnected)";
+    const statusLabel = m.connected ? "" : " (reconnecting)";
     label.textContent = `${roleLabel} ${m.participant_id.slice(0, 6)}${statusLabel}`;
-    li.appendChild(label);
+    info.appendChild(label);
+    li.appendChild(info);
 
     if (isAdmin && m.role === "guest") {
       const kickBtn = document.createElement("button");
@@ -220,11 +482,6 @@ function buildMessageElement(m) {
   return li;
 }
 
-function scrollMessagesToBottom() {
-  const container = els.messageList.parentElement;
-  if (container) container.scrollTop = container.scrollHeight;
-}
-
 function renderMessages(messages) {
   while (els.messageList.firstChild) {
     els.messageList.removeChild(els.messageList.firstChild);
@@ -234,6 +491,7 @@ function renderMessages(messages) {
     frag.appendChild(buildMessageElement(m));
   }
   els.messageList.appendChild(frag);
+  updateEmptyChatHint();
   scrollMessagesToBottom();
 }
 
@@ -242,8 +500,18 @@ function appendMessageIncremental(m) {
   for (const node of els.messageList.children) {
     if (node.dataset.messageId === m.message_id) return;
   }
+  // Check scroll position BEFORE inserting new DOM node so reading older history is respected!
+  const shouldAutoScroll = Boolean(m.is_self) || isNearBottom();
   els.messageList.appendChild(buildMessageElement(m));
-  scrollMessagesToBottom();
+  updateEmptyChatHint();
+  if (shouldAutoScroll) {
+    scrollMessagesToBottom();
+  } else {
+    unreadWhileScrolledUp += 1;
+    els.btnNewMessages.textContent =
+      unreadWhileScrolledUp === 1 ? "New message ↓" : `${unreadWhileScrolledUp} new messages ↓`;
+    els.btnNewMessages.classList.remove("hidden");
+  }
 }
 
 function removeMessagesIncremental(ids) {
@@ -256,6 +524,7 @@ function removeMessagesIncremental(ids) {
     }
     node = next;
   }
+  updateEmptyChatHint();
 }
 
 function canAcceptRenderMessage(msg) {
@@ -267,165 +536,214 @@ function canAcceptRenderMessage(msg) {
   );
 }
 
-worker.addEventListener("message", (ev) => {
-  let msg;
-  try {
-    msg = JSON.parse(ev.data);
-  } catch {
-    return;
+// ===== Pre-flight WebAssembly Check & Immediate Invite Feedback =====
+const runtimeSupport = checkRuntimeSupport();
+
+if (!runtimeSupport.ok) {
+  showUnsupportedBrowser(runtimeSupport.reason);
+} else {
+  // Show join progress IMMEDIATELY when opened via an invite link (never flash Create Room!).
+  if (pendingInvite && pendingInvite.valid) {
+    configurePendingView(
+      "connecting",
+      "Opening invite link — initializing end-to-end encryption…",
+    );
+    showOnlyView("pending");
+  } else if (pendingInvite && !pendingInvite.valid) {
+    clearPendingInviteMemory();
+    configureEndedView(
+      "ended",
+      "This invite link is incomplete or corrupted. Please ask the room admin for a fresh one-time invite link.",
+    );
+    showOnlyView("ended");
   }
 
-  switch (msg.type) {
-    case "worker_ready":
-      els.statusLine.textContent = "Ready (WASM worker active)";
-      if (pendingInvite) {
-        const invite = pendingInvite;
-        pendingInvite = null;
-        sendWorker({
-          type: "join_room",
-          relay_url: els.relayUrlInput.value.trim(),
-          room_id: invite.roomId,
-          invite_token: invite.token,
-          admin_fingerprint: invite.fp,
-        });
-        invite.roomId = null;
-        invite.token = null;
-        invite.fp = null;
-        invite.relayOverride = null;
-      }
-      break;
+  try {
+    worker = new Worker("./worker.js", { type: "module" });
+  } catch (err) {
+    showUnsupportedBrowser(err instanceof Error ? err.message : String(err));
+  }
+}
 
-    case "mls_selftest_result":
-      if (msg.ok && msg.report) {
-        els.selftestOutput.textContent = `OK (${msg.report.cipher_suite}, epochs 0->${msg.report.epoch_after_add}->${msg.report.epoch_after_remove}, removal isolated)`;
-      } else {
-        els.selftestOutput.textContent = "ERROR: " + (msg.error || "Unknown");
-      }
-      break;
+if (worker) {
+  worker.addEventListener("error", (ev) => {
+    const detail = ev && ev.message ? ev.message : "Worker failed to initialize.";
+    if (currentState.phase === "idle" || currentState.phase === "connecting" || openedViaInvite) {
+      showUnsupportedBrowser(detail);
+    } else {
+      showError(detail);
+    }
+  });
 
-    case "clear_display":
-      clearVisibleMessagesDom();
-      if (currentState.phase === "reconnecting" || document.hidden || visibilityShieldLocked) {
-        els.shieldReason.textContent = msg.reason || "History hidden.";
-        showOnlyView("shield");
-      }
-      break;
-
-    case "visibility_verified":
-      if (
-        !document.hidden &&
-        currentState.phase === "active" &&
-        msg.visibility_token === visibilityToken
-      ) {
-        visibilityShieldLocked = false;
-        showOnlyView("chat");
-      }
-      break;
-
-    case "render_history":
-      if (canAcceptRenderMessage(msg)) {
-        renderMessages(msg.messages || []);
-      }
-      break;
-
-    case "append_message":
-      if (canAcceptRenderMessage(msg)) {
-        appendMessageIncremental(msg.message);
-      }
-      break;
-
-    case "remove_messages":
-      if (canAcceptRenderMessage(msg)) {
-        removeMessagesIncremental(msg.message_ids || []);
-      }
-      break;
-
-    case "invite_ready": {
-      // Section 1: Invite links ALWAYS use the actual assigned Pages origin.
-      const base = `${window.location.origin}${window.location.pathname}`;
-      const frag = new URLSearchParams({
-        r: msg.room_id,
-        t: msg.invite_token,
-        fp: msg.admin_fingerprint,
-      });
-      els.inviteLinkOutput.value = `${base}#${frag.toString()}`;
-      els.inviteOutputBox.classList.remove("hidden");
-      break;
+  worker.addEventListener("message", (ev) => {
+    let msg;
+    try {
+      msg = JSON.parse(ev.data);
+    } catch {
+      return;
     }
 
-    case "state_update":
-      currentState = {
-        phase: msg.phase,
-        role: msg.role,
-        roomExpiresAtMs: msg.room_expires_at_ms || 0,
-        messagingPaused: Boolean(msg.messaging_paused),
-      };
-      els.statusLine.textContent = msg.status_text || msg.phase;
+    switch (msg.type) {
+      case "worker_ready":
+        els.statusLine.textContent = "Ready (WASM encryption active)";
+        if (pendingInvite && pendingInvite.valid) {
+          const invite = pendingInvite;
+          pendingInvite = null;
+          configurePendingView("connecting", "Connecting to relay with your one-time invite…");
+          showOnlyView("pending");
+          sendWorker({
+            type: "join_room",
+            relay_url: els.relayUrlInput.value.trim(),
+            room_id: invite.roomId,
+            invite_token: invite.token,
+            admin_fingerprint: invite.fp,
+          });
+          invite.roomId = null;
+          invite.token = null;
+          invite.fp = null;
+          invite.relayOverride = null;
+        }
+        break;
 
-      if (msg.phase === "idle") {
-        visibilityShieldLocked = false;
-        clearVisibleMessagesDom();
-        showOnlyView("landing");
-      } else if (msg.phase === "connecting" || msg.phase === "pending_join") {
-        visibilityShieldLocked = false;
-        els.pendingText.textContent = msg.status_text;
-        showOnlyView("pending");
-      } else if (msg.phase === "reconnecting") {
-        visibilityShieldLocked = true;
-        clearVisibleMessagesDom();
-        els.shieldReason.textContent = msg.status_text;
-        showOnlyView("shield");
-      } else if (msg.phase === "active") {
-        const isAdmin = msg.role === "admin";
-        els.metaRoomId.textContent = msg.room_id || "";
-        els.metaEpoch.textContent = String(msg.epoch ?? 0);
-        els.metaMsgTtl.textContent = formatTtl(msg.policy.msg_ttl_secs);
-        els.metaRoomCountdown.textContent = formatCountdown(msg.room_expires_at_ms);
-        els.liveMsgTtl.value = String(msg.policy.msg_ttl_secs);
-        els.liveRoomTtl.value = String(msg.policy.room_ttl_secs);
-        els.adminControls.classList.toggle("hidden", !isAdmin);
-        els.pauseBanner.classList.toggle("hidden", !msg.messaging_paused);
-        els.messageInput.disabled = Boolean(msg.messaging_paused);
-        els.btnSend.disabled = Boolean(msg.messaging_paused);
-        renderMembers(msg.members || [], isAdmin);
-        if (document.hidden || visibilityShieldLocked) {
-          clearVisibleMessagesDom();
-          showOnlyView("shield");
+      case "mls_selftest_result":
+        if (msg.ok && msg.report) {
+          els.selftestOutput.textContent = `OK (${msg.report.cipher_suite}, epochs 0->${msg.report.epoch_after_add}->${msg.report.epoch_after_remove}, removal isolated)`;
         } else {
+          els.selftestOutput.textContent = "ERROR: " + (msg.error || "Unknown");
+        }
+        break;
+
+      case "clear_display":
+        clearVisibleMessagesDom();
+        if (currentState.phase === "reconnecting" || document.hidden || visibilityShieldLocked) {
+          configureShieldView(
+            currentState.phase === "reconnecting" ? "reconnecting" : "hidden",
+            msg.reason || "History hidden.",
+          );
+          showOnlyView("shield");
+        }
+        break;
+
+      case "visibility_verified":
+        if (
+          !document.hidden &&
+          currentState.phase === "active" &&
+          msg.visibility_token === visibilityToken
+        ) {
+          visibilityShieldLocked = false;
           showOnlyView("chat");
         }
-      } else if (msg.phase === "wiped_local") {
-        visibilityShieldLocked = false;
-        clearVisibleMessagesDom();
-        els.endedTitle.textContent = "Cleared locally (Panic-Wipe)";
-        els.endedReason.textContent = msg.status_text;
-        showOnlyView("ended");
-      } else if (msg.phase === "wiped_confirmed") {
-        visibilityShieldLocked = false;
-        clearVisibleMessagesDom();
-        els.endedTitle.textContent = "Room closure confirmed by relay";
-        els.endedReason.textContent = msg.status_text;
-        showOnlyView("ended");
-      } else if (msg.phase === "wiped_unconfirmed") {
-        visibilityShieldLocked = false;
-        clearVisibleMessagesDom();
-        els.endedTitle.textContent = "Cleared locally — room closure unconfirmed";
-        els.endedReason.textContent = msg.status_text;
-        showOnlyView("ended");
-      } else if (msg.phase === "ended") {
-        visibilityShieldLocked = false;
-        clearVisibleMessagesDom();
-        els.endedTitle.textContent = "Chat room ended";
-        els.endedReason.textContent = msg.status_text;
-        showOnlyView("ended");
-      }
-      break;
+        break;
 
-    case "error":
-      showError(msg.message || msg.code);
-      break;
-  }
-});
+      case "render_history":
+        if (canAcceptRenderMessage(msg)) {
+          renderMessages(msg.messages || []);
+        }
+        break;
+
+      case "append_message":
+        if (canAcceptRenderMessage(msg)) {
+          appendMessageIncremental(msg.message);
+        }
+        break;
+
+      case "remove_messages":
+        if (canAcceptRenderMessage(msg)) {
+          removeMessagesIncremental(msg.message_ids || []);
+        }
+        break;
+
+      case "invite_ready": {
+        // Section 1: Invite links ALWAYS use the actual assigned Pages origin.
+        const base = `${window.location.origin}${window.location.pathname}`;
+        const frag = new URLSearchParams({
+          r: msg.room_id,
+          t: msg.invite_token,
+          fp: msg.admin_fingerprint,
+        });
+        els.inviteLinkOutput.value = `${base}#${frag.toString()}`;
+        els.inviteOutputBox.classList.remove("hidden");
+        setDrawerOpen(true);
+        break;
+      }
+
+      case "state_update": {
+        const members = msg.members || [];
+        currentState = {
+          phase: msg.phase,
+          role: msg.role,
+          roomExpiresAtMs: msg.room_expires_at_ms || 0,
+          messagingPaused: Boolean(msg.messaging_paused),
+          memberCount: members.length,
+        };
+        els.statusLine.textContent = msg.status_text || msg.phase;
+
+        if (msg.phase === "idle") {
+          visibilityShieldLocked = false;
+          clearVisibleMessagesDom();
+          showOnlyView("landing");
+        } else if (msg.phase === "connecting") {
+          visibilityShieldLocked = false;
+          configurePendingView("connecting", msg.status_text);
+          showOnlyView("pending");
+        } else if (msg.phase === "pending_join") {
+          visibilityShieldLocked = false;
+          configurePendingView("waiting_admin", msg.status_text);
+          showOnlyView("pending");
+        } else if (msg.phase === "reconnecting") {
+          visibilityShieldLocked = true;
+          clearVisibleMessagesDom();
+          configureShieldView("reconnecting", msg.status_text);
+          showOnlyView("shield");
+        } else if (msg.phase === "active") {
+          const isAdmin = msg.role === "admin";
+          const ttlLabel = formatTtl(msg.policy.msg_ttl_secs);
+          els.metaRoomId.textContent = msg.room_id || "";
+          els.metaEpoch.textContent = String(msg.epoch ?? 0);
+          els.metaMsgTtl.textContent = ttlLabel;
+          els.metaMsgTtlPill.textContent = ttlLabel;
+          els.metaRoomCountdown.textContent = formatCountdown(msg.room_expires_at_ms);
+          els.liveMsgTtl.value = String(msg.policy.msg_ttl_secs);
+          els.liveRoomTtl.value = String(msg.policy.room_ttl_secs);
+          els.adminControls.classList.toggle("hidden", !isAdmin);
+          els.pauseBanner.classList.toggle("hidden", !msg.messaging_paused);
+          els.chatStatusDot.className =
+            "status-dot " + (msg.messaging_paused ? "paused" : "online");
+          els.messageInput.disabled = Boolean(msg.messaging_paused);
+          els.btnSend.disabled = Boolean(msg.messaging_paused);
+          renderMembers(members, isAdmin);
+          updateEmptyChatHint();
+          if (document.hidden || visibilityShieldLocked) {
+            clearVisibleMessagesDom();
+            configureShieldView(document.hidden ? "hidden" : "verifying");
+            showOnlyView("shield");
+          } else {
+            showOnlyView("chat");
+          }
+        } else if (
+          msg.phase === "wiped_local" ||
+          msg.phase === "wiped_confirmed" ||
+          msg.phase === "wiped_unconfirmed" ||
+          msg.phase === "ended"
+        ) {
+          visibilityShieldLocked = false;
+          clearVisibleMessagesDom();
+          configureEndedView(msg.phase, msg.status_text);
+          showOnlyView("ended");
+        }
+        break;
+      }
+
+      case "error":
+        if (msg.code === "wasm_boot_failed" || msg.code === "wasm_unavailable") {
+          showUnsupportedBrowser(msg.message || msg.code);
+        } else {
+          showError(msg.message || msg.code);
+        }
+        break;
+    }
+  });
+}
 
 // Section 6: Immediately clear visible DOM & lock shield on tab switch / app switch / phone lock.
 function handleVisibilityHidden() {
@@ -434,8 +752,10 @@ function handleVisibilityHidden() {
     visibilityShieldLocked = true;
     clearVisibleMessagesDom();
     els.messageInput.value = "";
-    els.shieldReason.textContent =
-      "Tab or app hidden. Deadlines, membership, and MLS epoch will be re-verified when you return.";
+    configureShieldView(
+      currentState.phase === "reconnecting" ? "reconnecting" : "hidden",
+      "Tab or app hidden. Deadlines, membership, and MLS epoch will be re-verified when you return.",
+    );
     showOnlyView("shield");
   }
   updateCountdownTimerState();
@@ -451,8 +771,12 @@ document.addEventListener("visibilitychange", () => {
       // Keep the shield UP and DOM empty until Worker confirms fresh relay verification!
       visibilityShieldLocked = true;
       clearVisibleMessagesDom();
-      els.shieldReason.textContent =
-        "Verifying room status, deadlines, and MLS epoch with relay...";
+      configureShieldView(
+        currentState.phase === "reconnecting" ? "reconnecting" : "verifying",
+        currentState.phase === "reconnecting"
+          ? "Connection interrupted — attempting to reconnect (60s window)…"
+          : "Verifying room status, deadlines, and MLS epoch with relay…",
+      );
       showOnlyView("shield");
     }
     sendWorker({ type: "ui_visible", visibility_token: visibilityToken });
@@ -463,7 +787,12 @@ window.addEventListener("pagehide", () => {
   handleVisibilityHidden();
 });
 
-// UI event handlers
+// ===== UI Event Handlers =====
+els.btnRoomDrawer.addEventListener("click", () => {
+  const isOpen = !els.roomDrawer.classList.contains("hidden");
+  setDrawerOpen(!isOpen);
+});
+
 els.btnCreateRoom.addEventListener("click", () => {
   sendWorker({
     type: "create_room",
@@ -474,11 +803,16 @@ els.btnCreateRoom.addEventListener("click", () => {
 });
 
 els.btnMlsSelftest.addEventListener("click", () => {
-  els.selftestOutput.textContent = "Running...";
+  els.selftestOutput.textContent = "Running…";
   sendWorker({ type: "run_mls_selftest" });
 });
 
 els.btnGenerateInvite.addEventListener("click", () => {
+  sendWorker({ type: "generate_invite" });
+});
+
+els.btnQuickInvite.addEventListener("click", () => {
+  setDrawerOpen(true);
   sendWorker({ type: "generate_invite" });
 });
 
@@ -516,6 +850,7 @@ els.btnLeaveRoom.addEventListener("click", () => {
 });
 
 els.btnCancelJoin.addEventListener("click", () => {
+  clearPendingInviteMemory();
   sendWorker({ type: "leave_room" });
   showOnlyView("landing");
 });
@@ -523,7 +858,7 @@ els.btnCancelJoin.addEventListener("click", () => {
 els.btnRestart.addEventListener("click", () => {
   clearVisibleMessagesDom();
   showOnlyView("landing");
-  els.statusLine.textContent = "Ready (WASM worker active)";
+  els.statusLine.textContent = "Ready (WASM encryption active)";
 });
 
 els.composerForm.addEventListener("submit", (ev) => {
@@ -532,4 +867,6 @@ els.composerForm.addEventListener("submit", (ev) => {
   if (!text.trim()) return;
   els.messageInput.value = "";
   sendWorker({ type: "send_message", text });
+  // Keep focus for smooth continuous mobile typing without dismissing keyboard.
+  els.messageInput.focus();
 });

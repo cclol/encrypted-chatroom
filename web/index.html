@@ -2,26 +2,53 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
+  <meta name="theme-color" content="#0d1017">
   <meta name="referrer" content="no-referrer">
   <meta name="geistr-relay-url" content="wss://geistr-relay.onrender.com/ws">
   <title>geistr — Zero-Trace MLS Chat</title>
   <link rel="stylesheet" href="./style.css">
 </head>
 <body>
-  <main class="shell">
-    <header class="topbar">
+  <main class="shell" id="app-shell">
+    <header class="topbar" id="app-topbar">
       <div class="brand">
         <h1>geistr</h1>
-        <span class="badge" id="mls-badge">MLS RFC 9420 · Classical (v1)</span>
+        <span class="badge" id="mls-badge">MLS v1</span>
       </div>
-      <div class="status-line" id="status-line" role="status" aria-live="polite">Initializing worker...</div>
+      <div class="status-line" id="status-line" role="status" aria-live="polite">Initializing encryption…</div>
     </header>
 
-    <!-- Privacy Shield shown when tab/app is hidden or reconnecting -->
-    <section id="shield-view" class="card hidden" aria-live="assertive">
-      <h2>Session hidden</h2>
-      <p id="shield-reason">The visible history has been cleared. Deadlines and membership will be re-verified when you return.</p>
+    <!-- Unsupported Browser / WebAssembly Disabled (e.g. iPhone Lockdown Mode) -->
+    <section id="unsupported-view" class="card status-card status-error hidden" role="alert" aria-live="assertive">
+      <span class="status-pill pill-danger">WebAssembly unavailable</span>
+      <h2 id="unsupported-title">Encryption cannot start in this browser</h2>
+      <p id="unsupported-summary">
+        geistr performs end-to-end MLS encryption locally via WebAssembly so messages are never readable by the relay server. WebAssembly is disabled or unavailable in this browser.
+      </p>
+      <div class="callout callout-warn">
+        <strong>Using an iPhone or iPad?</strong>
+        <p>
+          Apple’s <strong>Lockdown Mode (Blockierungsmodus)</strong> disables WebAssembly in Safari by default.
+        </p>
+      </div>
+      <div class="callout callout-info">
+        <strong>How to continue</strong>
+        <p id="unsupported-next-step">
+          Open the <strong>original invite link</strong> you received on another compatible device or browser (or allow WebAssembly for this site in Safari Website Settings if you intentionally choose to).
+        </p>
+      </div>
+      <p id="unsupported-detail" class="mono small muted hidden"></p>
+    </section>
+
+    <!-- Privacy Shield shown when tab/app is hidden, verifying on return, or reconnecting -->
+    <section id="shield-view" class="card status-card hidden" data-shield-kind="hidden" aria-live="assertive">
+      <div class="status-head">
+        <span class="status-pill" id="shield-badge">Session hidden</span>
+        <span class="spinner hidden" id="shield-spinner" aria-hidden="true"></span>
+      </div>
+      <h2 id="shield-title">History hidden</h2>
+      <p id="shield-reason">The visible history has been cleared. Deadlines, membership, and MLS epoch will be re-verified when you return.</p>
     </section>
 
     <!-- Landing / Create Room View -->
@@ -47,62 +74,90 @@
         </select>
       </div>
 
-      <details class="relay-config">
+      <details class="collapsible-section relay-config">
         <summary>Relay connection &amp; browser MLS verification</summary>
-        <div class="field-row">
-          <label for="relay-url-input">Relay WSS endpoint</label>
-          <input id="relay-url-input" type="url" autocomplete="off" spellcheck="false">
-        </div>
-        <div class="actions-inline">
-          <button type="button" id="btn-mls-selftest" class="secondary">Run browser MLS self-test</button>
-          <span id="selftest-output" class="mono small" role="status" aria-live="polite"></span>
+        <div class="collapsible-body">
+          <div class="field-row">
+            <label for="relay-url-input">Relay WSS endpoint</label>
+            <input id="relay-url-input" type="url" autocomplete="off" spellcheck="false">
+          </div>
+          <div class="actions-inline">
+            <button type="button" id="btn-mls-selftest" class="secondary">Run browser MLS self-test</button>
+            <span id="selftest-output" class="mono small" role="status" aria-live="polite"></span>
+          </div>
         </div>
       </details>
 
       <div class="actions">
-        <button type="button" id="btn-create-room" class="primary">Create room</button>
+        <button type="button" id="btn-create-room" class="primary btn-block">Create room</button>
       </div>
     </section>
 
     <!-- Pending Join View -->
-    <section id="pending-view" class="card hidden" aria-live="polite">
-      <h2>Joining room...</h2>
-      <p id="pending-text">Waiting for automatic admission by the room admin and verification of the admin identity.</p>
-      <button type="button" id="btn-cancel-join" class="secondary">Cancel</button>
+    <section id="pending-view" class="card status-card status-pending hidden" aria-live="polite">
+      <div class="status-head">
+        <span class="status-pill pill-accent" id="pending-badge">Joining via invite</span>
+        <span class="spinner" aria-hidden="true"></span>
+      </div>
+      <h2 id="pending-title">Joining room…</h2>
+      <p id="pending-text">Initializing end-to-end encryption and connecting to the room.</p>
+      <p class="hint" id="pending-subhint">Admission completes automatically once the room admin responds and the admin’s identity key is verified.</p>
+      <div class="actions">
+        <button type="button" id="btn-cancel-join" class="secondary btn-block">Cancel</button>
+      </div>
     </section>
 
-    <!-- Active Chat View -->
-    <section id="chat-view" class="hidden">
-      <div class="room-meta card">
-        <div class="meta-grid">
-          <div>
+    <!-- Active Chat View (full-viewport mobile-first layout) -->
+    <section id="chat-view" class="chat-view hidden" aria-label="Encrypted chat">
+      <!-- Compact single-row mobile header -->
+      <div class="chat-header">
+        <button
+          type="button"
+          id="btn-room-drawer"
+          class="chat-room-toggle"
+          aria-expanded="false"
+          aria-controls="room-drawer"
+        >
+          <span class="status-dot online" id="chat-status-dot" aria-hidden="true"></span>
+          <span class="chat-room-metrics">
+            <span class="chat-countdown mono" id="meta-room-countdown">--:--</span>
+            <span class="chat-sep" aria-hidden="true">·</span>
+            <span class="chat-members-pill"><span id="member-count">0</span>/4</span>
+            <span class="chat-sep hide-xs" aria-hidden="true">·</span>
+            <span class="chat-ttl-pill hide-xs" id="meta-msg-ttl-pill">30m</span>
+          </span>
+          <span class="chevron" aria-hidden="true">▾</span>
+        </button>
+
+        <button type="button" id="btn-leave-room" class="secondary chat-leave-btn">Leave</button>
+      </div>
+
+      <!-- Collapsible Room Details & Admin Drawer (collapsed by default to prioritize history) -->
+      <div id="room-drawer" class="room-drawer card hidden">
+        <div class="drawer-meta-grid">
+          <div class="meta-cell">
             <span class="label">Room ID</span>
             <span id="meta-room-id" class="mono"></span>
           </div>
-          <div>
+          <div class="meta-cell">
             <span class="label">MLS Epoch</span>
             <span id="meta-epoch" class="mono">0</span>
           </div>
-          <div>
-            <span class="label">Room expires in</span>
-            <span id="meta-room-countdown" class="mono">--:--</span>
-          </div>
-          <div>
+          <div class="meta-cell">
             <span class="label">Message lifetime</span>
             <span id="meta-msg-ttl" class="mono">30m</span>
           </div>
         </div>
 
         <div class="members-box">
-          <span class="label">Participants (<span id="member-count">0</span>/4)</span>
+          <span class="label">Participants</span>
           <ul id="member-list" class="member-list"></ul>
         </div>
 
         <!-- Admin Controls -->
         <div id="admin-controls" class="admin-panel hidden">
-          <div class="admin-row">
-            <button type="button" id="btn-generate-invite" class="primary">Generate one-time link</button>
-            <button type="button" id="btn-panic-wipe" class="danger">Panic-Wipe (Close now)</button>
+          <div class="admin-primary-actions">
+            <button type="button" id="btn-generate-invite" class="primary btn-block">Generate one-time invite link</button>
           </div>
 
           <div id="invite-output-box" class="invite-box hidden">
@@ -113,51 +168,84 @@
             </div>
           </div>
 
-          <div class="admin-policy-row">
-            <label for="live-msg-ttl">Message:</label>
-            <select id="live-msg-ttl">
-              <option value="300">5m</option>
-              <option value="1800">30m</option>
-              <option value="3600">1h</option>
-            </select>
-            <label for="live-room-ttl">Room:</label>
-            <select id="live-room-ttl">
-              <option value="300">5m</option>
-              <option value="1800">30m</option>
-              <option value="3600">1h</option>
-            </select>
-            <button type="button" id="btn-apply-policy" class="secondary">Apply lifetimes</button>
+          <!-- Rarely used lifetime settings collapsed by default -->
+          <details class="collapsible-section admin-settings-details" id="admin-policy-details">
+            <summary>Room &amp; message lifetimes</summary>
+            <div class="collapsible-body">
+              <div class="field-row">
+                <label for="live-msg-ttl">Message lifetime</label>
+                <select id="live-msg-ttl">
+                  <option value="300">5 minutes</option>
+                  <option value="1800">30 minutes</option>
+                  <option value="3600">1 hour</option>
+                </select>
+              </div>
+              <div class="field-row">
+                <label for="live-room-ttl">Room lifetime</label>
+                <select id="live-room-ttl">
+                  <option value="300">5 minutes</option>
+                  <option value="1800">30 minutes</option>
+                  <option value="3600">1 hour</option>
+                </select>
+              </div>
+              <button type="button" id="btn-apply-policy" class="secondary btn-block">Apply lifetimes</button>
+            </div>
+          </details>
+
+          <!-- Clearly separated Danger Zone for Panic-Wipe -->
+          <div class="danger-zone">
+            <span class="label danger-label">Emergency room shutdown</span>
+            <button type="button" id="btn-panic-wipe" class="danger btn-block">Panic-Wipe — Close room now</button>
           </div>
         </div>
-
-        <div class="room-footer-actions">
-          <button type="button" id="btn-leave-room" class="secondary">Leave room</button>
-        </div>
       </div>
 
-      <div id="pause-banner" class="banner warning hidden" role="alert">
-        Messaging is paused until the membership change completes in the new MLS epoch.
+      <div id="pause-banner" class="banner warning compact-banner hidden" role="alert">
+        Messaging paused until the MLS membership change completes.
       </div>
 
-      <section class="messages-card card" aria-label="Chat history">
-        <ol id="message-list" class="message-list" aria-live="polite"></ol>
-      </section>
+      <!-- Primary scrollable message area -->
+      <div class="messages-wrap">
+        <section class="messages-scroll" id="messages-scroll" aria-label="Chat history">
+          <div id="empty-chat-hint" class="empty-chat-hint">
+            <p class="hint">End-to-end encrypted MLS room active. Messages exist only in RAM and disappear automatically.</p>
+            <button type="button" id="btn-quick-invite" class="secondary hidden">Create one-time invite link</button>
+          </div>
+          <ol id="message-list" class="message-list" aria-live="polite"></ol>
+        </section>
 
+        <button type="button" id="btn-new-messages" class="jump-bottom-btn hidden" aria-label="Jump to newest messages">
+          New messages ↓
+        </button>
+      </div>
+
+      <!-- Docked one-handed bottom composer -->
       <form id="composer-form" class="composer" autocomplete="off">
         <label for="message-input" class="sr-only">Enter message</label>
-        <input id="message-input" type="text" maxlength="4000" placeholder="Encrypted message..." autocomplete="off" spellcheck="false">
+        <input
+          id="message-input"
+          type="text"
+          maxlength="4000"
+          placeholder="Encrypted message…"
+          enterkeyhint="send"
+          autocomplete="off"
+          spellcheck="false"
+        >
         <button type="submit" id="btn-send" class="primary">Send</button>
       </form>
     </section>
 
     <!-- Ended / Wiped View -->
-    <section id="ended-view" class="card hidden" aria-live="assertive">
+    <section id="ended-view" class="card status-card hidden" data-ended-kind="ended" aria-live="assertive">
+      <span class="status-pill" id="ended-badge">Room ended</span>
       <h2 id="ended-title">Session ended</h2>
       <p id="ended-reason"></p>
-      <button type="button" id="btn-restart" class="primary">Back to start</button>
+      <div class="actions">
+        <button type="button" id="btn-restart" class="primary btn-block">Back to start</button>
+      </div>
     </section>
 
-    <div id="error-toast" class="banner error hidden" role="alert"></div>
+    <div id="error-toast" class="banner error toast hidden" role="alert"></div>
   </main>
 
   <script type="module" src="./app.js"></script>

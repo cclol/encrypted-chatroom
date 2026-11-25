@@ -1,6 +1,16 @@
 import init, { start_worker } from "./pkg/web_client.js";
 
 async function bootstrap() {
+  if (typeof WebAssembly !== "object" || typeof WebAssembly.instantiate !== "function") {
+    self.postMessage(
+      JSON.stringify({
+        type: "error",
+        code: "wasm_unavailable",
+        message: "WebAssembly is disabled or unavailable in this browser.",
+      }),
+    );
+    return;
+  }
   try {
     await init();
     start_worker();
