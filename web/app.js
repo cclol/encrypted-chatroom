@@ -44,6 +44,7 @@ const els = {
   memberCount: document.getElementById("member-count"),
   memberList: document.getElementById("member-list"),
   adminControls: document.getElementById("admin-controls"),
+  adminWipeBar: document.getElementById("admin-wipe-bar"),
   btnGenerateInvite: document.getElementById("btn-generate-invite"),
   btnQuickInvite: document.getElementById("btn-quick-invite"),
   btnPanicWipe: document.getElementById("btn-panic-wipe"),
@@ -797,6 +798,7 @@ if (worker) {
           els.liveMsgTtl.value = String(msg.policy.msg_ttl_secs);
           els.liveRoomTtl.value = String(msg.policy.room_ttl_secs);
           els.adminControls.classList.toggle("hidden", !isAdmin);
+          els.adminWipeBar.classList.toggle("hidden", !isAdmin);
           els.pauseBanner.classList.toggle("hidden", !msg.messaging_paused);
           els.chatStatusDot.className =
             "status-dot " + (msg.messaging_paused ? "paused" : "online");
