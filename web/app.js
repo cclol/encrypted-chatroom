@@ -14,6 +14,7 @@ const els = {
   shieldSpinner: document.getElementById("shield-spinner"),
   shieldTitle: document.getElementById("shield-title"),
   shieldReason: document.getElementById("shield-reason"),
+  btnRetrySession: document.getElementById("btn-retry-session"),
   landingView: document.getElementById("landing-view"),
   pendingView: document.getElementById("pending-view"),
   pendingBadge: document.getElementById("pending-badge"),
@@ -154,6 +155,8 @@ let currentState = {
 // Monotonic visibility token ensures stale pre-hide render frames can NEVER flash on return (Finding 6).
 let visibilityToken = 0;
 let visibilityShieldLocked = false;
+let sessionRetryTimer = null;
+let sessionRetryCount = 0;
 let countdownTimerId = null;
 let worker = null;
 let unreadWhileScrolledUp = 0;
@@ -280,6 +283,10 @@ function formatCountdown(targetMs) {
 }
 
 function showOnlyView(viewName) {
+  if (viewName !== "shield" || document.hidden) {
+    window.clearTimeout(sessionRetryTimer);
+    sessionRetryTimer = null;
+  }
   const isChat = viewName === "chat";
   document.body.classList.toggle("in-chat", isChat);
   els.unsupportedView.classList.toggle("hidden", viewName !== "unsupported");
@@ -314,6 +321,7 @@ function showUnsupportedBrowser(reasonDetail) {
 
 function configureShieldView(kind, reasonText) {
   els.shieldView.dataset.shieldKind = kind;
+  els.btnRetrySession.classList.toggle("hidden", kind === "hidden" || document.hidden);
   if (kind === "reconnecting") {
     els.shieldBadge.textContent = "Reconnecting";
     els.shieldBadge.className = "status-pill pill-warn";
@@ -841,6 +849,9 @@ if (worker) {
 
 // Section 6: Immediately clear visible DOM & lock shield on tab switch / app switch / phone lock.
 function handleVisibilityHidden() {
+  window.clearTimeout(sessionRetryTimer);
+  sessionRetryTimer = null;
+  sessionRetryCount = 0;
   visibilityToken += 1;
   if (currentState.phase === "active" || currentState.phase === "reconnecting") {
     visibilityShieldLocked = true;
@@ -856,10 +867,8 @@ function handleVisibilityHidden() {
   sendWorker({ type: "ui_hidden" });
 }
 
-document.addEventListener("visibilitychange", () => {
-  if (document.hidden) {
-    handleVisibilityHidden();
-  } else {
+function recheckVisibleSession() {
+  if (!document.hidden) {
     visibilityToken += 1;
     if (currentState.phase === "active" || currentState.phase === "reconnecting") {
       // Keep the shield UP and DOM empty until Worker confirms fresh relay verification!
@@ -874,11 +883,39 @@ document.addEventListener("visibilitychange", () => {
       showOnlyView("shield");
     }
     sendWorker({ type: "ui_visible", visibility_token: visibilityToken });
+    window.clearTimeout(sessionRetryTimer);
+    sessionRetryTimer = null;
+    // Give the worker's own verification and reconnect timers time to run first.
+    if (visibilityShieldLocked && sessionRetryCount < 2) {
+      sessionRetryTimer = window.setTimeout(() => {
+        sessionRetryTimer = null;
+        if (!document.hidden && visibilityShieldLocked && currentState.phase === "active") {
+          sessionRetryCount += 1;
+          recheckVisibleSession();
+        }
+      }, 10_000);
+    }
+  }
+}
+
+els.btnRetrySession.addEventListener("click", recheckVisibleSession);
+
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) {
+    handleVisibilityHidden();
+  } else {
+    recheckVisibleSession();
   }
 });
 
 window.addEventListener("pagehide", () => {
   handleVisibilityHidden();
+});
+
+window.addEventListener("pageshow", (event) => {
+  if (event.persisted && visibilityShieldLocked && sessionRetryTimer === null) {
+    recheckVisibleSession();
+  }
 });
 
 // ===== UI Event Handlers =====
