@@ -205,7 +205,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<RelayState>, client_ip: IpA
                     match serde_json::from_str::<ClientToRelay>(&text) {
                         Ok(parsed) => {
                             state
-                                .handle_message(conn_id, &handle, &mut binding, parsed)
+                                .handle_message(conn_id, client_ip, &handle, &mut binding, parsed)
                                 .await;
                         }
                         Err(_) => {

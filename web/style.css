@@ -557,6 +557,7 @@ button.small-btn {
 /* Collapsible Room & Admin Drawer */
 .room-drawer {
   flex: 0 1 auto;
+  min-height: 0;
   max-height: 62%;
   overflow-y: auto;
   -webkit-overflow-scrolling: touch;
@@ -685,7 +686,7 @@ button.small-btn {
 
 /* Primary scrollable chat history area */
 .messages-wrap {
-  flex: 1 1 auto;
+  flex: 1 1 0;
   min-height: 0;
   position: relative;
   display: flex;

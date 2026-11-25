@@ -21,6 +21,9 @@ use crate::config::RelayConfig;
 const MAX_COMMIT_LOG_LEN: usize = 64;
 const RESUME_RETRY_WINDOW_MS: u64 = 30_000;
 const WELCOME_CACHE_WINDOW_MS: u64 = 30_000;
+const MAX_ROOM_CREATIONS_PER_IP_PER_MIN: usize = 10;
+const CHAT_MESSAGE_REFILL_MS: u64 = 1_500; // 40 messages per minute
+const CHAT_MESSAGE_BURST: u64 = 10;
 
 pub fn now_ms() -> u64 {
     SystemTime::now()
@@ -145,7 +148,35 @@ struct MemberEntry {
     resume_token_hash: String,
     pending_resume: Option<PendingResume>,
     confirmed_epoch: u64,
+    chat_send_budget: ChatSendBudget,
     conn: MemberConn,
+}
+
+struct ChatSendBudget {
+    credit_ms: u64,
+    updated_at_ms: u64,
+}
+
+impl ChatSendBudget {
+    fn new(now: u64) -> Self {
+        Self {
+            credit_ms: CHAT_MESSAGE_BURST * CHAT_MESSAGE_REFILL_MS,
+            updated_at_ms: now,
+        }
+    }
+
+    fn try_consume(&mut self, now: u64) -> bool {
+        self.credit_ms = self
+            .credit_ms
+            .saturating_add(now.saturating_sub(self.updated_at_ms))
+            .min(CHAT_MESSAGE_BURST * CHAT_MESSAGE_REFILL_MS);
+        self.updated_at_ms = self.updated_at_ms.max(now);
+        if self.credit_ms < CHAT_MESSAGE_REFILL_MS {
+            return false;
+        }
+        self.credit_ms -= CHAT_MESSAGE_REFILL_MS;
+        true
+    }
 }
 
 #[derive(Clone)]
@@ -369,6 +400,7 @@ struct IpLimiter {
     total_active_conns: usize,
     active_conns: HashMap<IpAddr, usize>,
     recent_attempts: HashMap<IpAddr, VecDeque<u64>>,
+    recent_room_creations: HashMap<IpAddr, VecDeque<u64>>,
 }
 
 impl IpLimiter {
@@ -377,6 +409,7 @@ impl IpLimiter {
             total_active_conns: 0,
             active_conns: HashMap::new(),
             recent_attempts: HashMap::new(),
+            recent_room_creations: HashMap::new(),
         }
     }
 
@@ -391,6 +424,34 @@ impl IpLimiter {
             }
             !attempts.is_empty()
         });
+    }
+
+    fn try_record_room_creation(&mut self, ip: IpAddr, now: u64, max_tracked_ips: usize) -> bool {
+        if !self.recent_room_creations.contains_key(&ip)
+            && self.recent_room_creations.len() >= max_tracked_ips
+        {
+            self.recent_room_creations.retain(|_, times| {
+                times
+                    .back()
+                    .is_some_and(|&ts| now.saturating_sub(ts) < 60_000)
+            });
+            if self.recent_room_creations.len() >= max_tracked_ips {
+                return false;
+            }
+        }
+
+        let times = self.recent_room_creations.entry(ip).or_default();
+        while times
+            .front()
+            .is_some_and(|&ts| now.saturating_sub(ts) >= 60_000)
+        {
+            times.pop_front();
+        }
+        if times.len() >= MAX_ROOM_CREATIONS_PER_IP_PER_MIN {
+            return false;
+        }
+        times.push_back(now);
+        true
     }
 
     fn try_acquire(&mut self, ip: IpAddr, now: u64, cfg: &RelayConfig) -> bool {
@@ -660,6 +721,7 @@ impl RelayState {
     pub async fn handle_message(
         self: &Arc<Self>,
         conn_id: u64,
+        client_ip: IpAddr,
         handle: &OutboundHandle,
         binding: &mut Option<ConnBinding>,
         msg: ClientToRelay,
@@ -672,8 +734,15 @@ impl RelayState {
                 admin_pubkey_b64,
                 initial_policy,
             } => {
-                self.handle_create_room(conn_id, handle, binding, admin_pubkey_b64, initial_policy)
-                    .await;
+                self.handle_create_room(
+                    conn_id,
+                    client_ip,
+                    handle,
+                    binding,
+                    admin_pubkey_b64,
+                    initial_policy,
+                )
+                .await;
             }
             ClientToRelay::JoinRoom {
                 room_id,
@@ -796,6 +865,7 @@ impl RelayState {
     async fn handle_create_room(
         &self,
         conn_id: u64,
+        client_ip: IpAddr,
         handle: &OutboundHandle,
         binding: &mut Option<ConnBinding>,
         admin_pubkey_b64: String,
@@ -860,6 +930,7 @@ impl RelayState {
                 resume_token_hash: sha256_hex(resume_token.as_bytes()),
                 pending_resume: None,
                 confirmed_epoch: 0,
+                chat_send_budget: ChatSendBudget::new(created_at),
                 conn: MemberConn::Connected {
                     conn_id,
                     handle: handle.clone(),
@@ -867,6 +938,19 @@ impl RelayState {
             },
         );
 
+        let admitted = self
+            .ip_limiter
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .try_record_room_creation(client_ip, created_at, self.config.max_tracked_ips);
+        if !admitted {
+            send_err(
+                handle,
+                "rate_limited",
+                "Room creation rate limit reached. Try again shortly.",
+            );
+            return;
+        }
         rooms.insert(
             room_id.clone(),
             Room {
@@ -1387,6 +1471,7 @@ impl RelayState {
                 pending_resume: None,
                 // Guest must verify Welcome and send AckCommit(new_epoch) before sending messages.
                 confirmed_epoch: prev_epoch,
+                chat_send_budget: ChatSendBudget::new(now),
                 conn: guest_conn,
             },
         );
@@ -2110,6 +2195,14 @@ impl RelayState {
         }
 
         if let Some(m) = room.members.get_mut(&b.participant_id) {
+            if !m.chat_send_budget.try_consume(now) {
+                send_err(
+                    handle,
+                    "rate_limited",
+                    "Message rate limit reached. Try again shortly.",
+                );
+                return;
+            }
             m.pending_resume = None;
         }
 
@@ -2412,6 +2505,37 @@ fn constant_time_eq_str(a: &str, b: &str) -> bool {
 mod tests {
     use super::*;
     use std::net::Ipv4Addr;
+
+    #[test]
+    fn chat_send_budget_allows_a_burst_and_refills_gradually() {
+        let mut budget = ChatSendBudget::new(1_000);
+        for _ in 0..10 {
+            assert!(budget.try_consume(1_000));
+        }
+        assert!(!budget.try_consume(1_000));
+        assert!(!budget.try_consume(2_499));
+        assert!(budget.try_consume(2_500));
+        assert!(!budget.try_consume(2_500));
+        for _ in 0..10 {
+            assert!(budget.try_consume(62_500));
+        }
+        assert!(!budget.try_consume(62_500));
+    }
+
+    #[test]
+    fn room_creation_limit_is_per_ip_and_uses_a_rolling_window() {
+        let mut limiter = IpLimiter::new();
+        let ip = "192.0.2.1".parse().unwrap();
+        let other = "192.0.2.2".parse().unwrap();
+        for now in 1_000..1_010 {
+            assert!(limiter.try_record_room_creation(ip, now, 4));
+        }
+        limiter.release(ip, 1_010);
+        assert!(!limiter.try_record_room_creation(ip, 60_999, 4));
+        assert!(limiter.try_record_room_creation(other, 60_999, 4));
+        assert!(limiter.try_record_room_creation(ip, 61_000, 4));
+        assert!(!limiter.try_record_room_creation(ip, 61_000, 4));
+    }
 
     #[test]
     fn ip_limiter_prunes_stale_keys_and_enforces_global_cap() {

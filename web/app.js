@@ -151,8 +151,9 @@ function sendWorker(cmd) {
 }
 
 function setDrawerOpen(open) {
-  els.roomDrawer.classList.toggle("hidden", !open);
-  els.btnRoomDrawer.setAttribute("aria-expanded", open ? "true" : "false");
+  const nextOpen = Boolean(open);
+  els.roomDrawer.classList.toggle("hidden", !nextOpen);
+  els.btnRoomDrawer.setAttribute("aria-expanded", nextOpen ? "true" : "false");
 }
 
 function updateEmptyChatHint() {
@@ -347,31 +348,41 @@ function scrollMessagesToBottom() {
   els.btnNewMessages.classList.add("hidden");
 }
 
+function isTextInputFocused() {
+  const el = document.activeElement;
+  if (!el) return false;
+  if (el === els.messageInput) return true;
+  const tag = el.tagName;
+  return (tag === "INPUT" || tag === "TEXTAREA") && !el.readOnly && !el.disabled;
+}
+
 function syncVisualViewport() {
   const vv = window.visualViewport;
   const height = vv ? Math.round(vv.height) : window.innerHeight;
   const offsetTop = vv ? Math.max(0, Math.round(vv.offsetTop)) : 0;
+  const isZoomed = Boolean(vv && vv.scale > 1.05);
+  const inputFocused = isTextInputFocused();
 
-  if (height > baseViewportHeight || Math.abs(window.innerWidth - (vv ? vv.width : window.innerWidth)) > 100) {
-    baseViewportHeight = Math.max(window.innerHeight || height, height);
+  if (!isZoomed && (!inputFocused || height > baseViewportHeight)) {
+    baseViewportHeight = Math.max(window.innerHeight || 0, height);
   }
 
   document.documentElement.style.setProperty("--vvh", `${height}px`);
   document.documentElement.style.setProperty("--vv-offset-top", `${offsetTop}px`);
 
   const referenceHeight = Math.max(window.innerHeight || 0, baseViewportHeight);
-  const keyboardLikelyOpen = referenceHeight > 0 && height < referenceHeight * 0.8;
+  const heightDrop = referenceHeight - height;
+  const keyboardLikelyOpen =
+    !isZoomed &&
+    inputFocused &&
+    referenceHeight > 0 &&
+    heightDrop >= 120 &&
+    height < referenceHeight * 0.85;
   const wasNearBottom = isNearBottom();
   document.body.classList.toggle("keyboard-open", keyboardLikelyOpen);
 
-  if (document.body.classList.contains("in-chat")) {
-    // Collapse drawer automatically if keyboard opens so composer + messages keep full priority.
-    if (keyboardLikelyOpen && !els.roomDrawer.classList.contains("hidden")) {
-      setDrawerOpen(false);
-    }
-    if (wasNearBottom) {
-      window.requestAnimationFrame(scrollMessagesToBottom);
-    }
+  if (document.body.classList.contains("in-chat") && wasNearBottom) {
+    window.requestAnimationFrame(scrollMessagesToBottom);
   }
 }
 
@@ -415,6 +426,16 @@ els.messageInput.addEventListener("focus", () => {
       scrollMessagesToBottom();
     }
   }, 180);
+});
+
+els.messageInput.addEventListener("click", () => {
+  if (!els.roomDrawer.classList.contains("hidden")) {
+    setDrawerOpen(false);
+  }
+});
+
+els.messageInput.addEventListener("blur", () => {
+  window.setTimeout(syncVisualViewport, 120);
 });
 
 // ===== Rendering =====
