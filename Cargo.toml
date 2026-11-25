@@ -1,0 +1,55 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core-crypto",
+    "crates/web-client",
+    "crates/relay-server",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[workspace.dependencies]
+# Serialization & encoding
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+base64 = "0.22"
+hex = "0.4"
+thiserror = "2.0"
+
+# Cryptography
+ed25519-dalek = { version = "2.1", default-features = false, features = ["fast", "zeroize"] }
+sha2 = "0.10"
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc", "getrandom"] }
+zeroize = { version = "1.8", features = ["derive"] }
+subtle = "2.6"
+getrandom = "0.3"
+getrandom_v2 = { package = "getrandom", version = "0.2" }
+
+# MLS (RFC 9420)
+mls-rs = { version = "0.58.0", default-features = false, features = ["std", "private_message", "by_ref_proposal", "out_of_order", "tree_index", "fast_serialize"] }
+mls-rs-crypto-rustcrypto = { version = "0.24.0", default-features = false, features = ["std"] }
+
+# Web / WASM
+wasm-bindgen = "=0.2.130"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-sys = "0.3"
+serde-wasm-bindgen = "0.6"
+
+# Relay server
+axum = { version = "0.8", features = ["ws", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "signal"] }
+futures-util = "0.3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tower-http = { version = "0.6", features = ["limit"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+opt-level = "s"

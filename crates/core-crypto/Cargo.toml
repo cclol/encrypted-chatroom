@@ -1,0 +1,27 @@
+[package]
+name = "core-crypto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = ["mls"]
+mls = ["dep:mls-rs", "dep:mls-rs-crypto-rustcrypto"]
+browser = ["mls-rs-crypto-rustcrypto?/browser", "getrandom/wasm_js", "getrandom_v2/js"]
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+base64.workspace = true
+hex.workspace = true
+thiserror.workspace = true
+ed25519-dalek.workspace = true
+sha2.workspace = true
+chacha20poly1305.workspace = true
+zeroize.workspace = true
+subtle.workspace = true
+getrandom.workspace = true
+getrandom_v2.workspace = true
+
+mls-rs = { workspace = true, optional = true }
+mls-rs-crypto-rustcrypto = { workspace = true, optional = true }

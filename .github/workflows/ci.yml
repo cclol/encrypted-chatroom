@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust-check-and-test:
+    name: Test native crates & build WASM worker
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain with wasm32 target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: clippy, rustfmt
+
+      - name: Cache Cargo registry & build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (native)
+        run: cargo clippy --workspace --exclude web-client --all-targets -- -D warnings
+
+      - name: Clippy (wasm32)
+        run: cargo clippy -p web-client --target wasm32-unknown-unknown -- -D warnings
+
+      - name: Run unit & integration tests
+        run: cargo test -p core-crypto -p relay-server -p web-client
+
+      - name: Build WASM worker (release)
+        run: cargo build --release --target wasm32-unknown-unknown -p web-client
+
+      - name: Install wasm-bindgen-cli (pinned to workspace version)
+        run: cargo install wasm-bindgen-cli --version 0.2.130 --locked
+
+      - name: Generate JS/WASM bindings and measure bundle size
+        run: |
+          wasm-bindgen --target web --no-typescript --out-dir web/pkg target/wasm32-unknown-unknown/release/web_client.wasm
+          gzip -k -9 web/pkg/web_client_bg.wasm
+          ls -lh web/pkg/web_client_bg.wasm web/pkg/web_client_bg.wasm.gz web/pkg/web_client.js web/app.js web/worker.js
+          rm web/pkg/web_client_bg.wasm.gz
+
+      - name: Upload static web artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: geistr-web-dist
+          path: web/
+          retention-days: 7

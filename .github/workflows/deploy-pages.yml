@@ -1,0 +1,70 @@
+name: Deploy Frontend to Cloudflare Pages (geistr)
+
+on:
+  workflow_dispatch:
+    inputs:
+      relay_wss_url:
+        description: "Production Koyeb Relay WSS URL (e.g. wss://geistr-relay.koyeb.app/ws)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  deployments: write
+
+jobs:
+  deploy-pages:
+    name: Build & Deploy geistr to Cloudflare Pages
+    runs-on: ubuntu-latest
+    # Protect production deployments with GitHub Environment approval rules (Section 8).
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain with wasm32 target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build WASM release bundle
+        run: cargo build --release --target wasm32-unknown-unknown -p web-client
+
+      - name: Install wasm-bindgen-cli
+        run: cargo install wasm-bindgen-cli --version 0.2.130 --locked
+
+      - name: Generate web/pkg bindings
+        run: wasm-bindgen --target web --no-typescript --out-dir web/pkg target/wasm32-unknown-unknown/release/web_client.wasm
+
+      - name: Inject exact production Relay WSS URL into index.html and _headers CSP
+        env:
+          RELAY_WSS_URL: ${{ inputs.relay_wss_url }}
+        run: |
+          python3 - <<'PY'
+          import os, urllib.parse
+          wss = os.environ["RELAY_WSS_URL"].strip()
+          parsed = urllib.parse.urlparse(wss)
+          assert parsed.scheme == "wss" and parsed.netloc, f"Invalid wss URL: {wss}"
+          wss_origin = f"wss://{parsed.netloc}"
+
+          with open("web/index.html", "r", encoding="utf-8") as f:
+              html = f.read()
+          html = html.replace("wss://geistr-relay.koyeb.app/ws", wss)
+          with open("web/index.html", "w", encoding="utf-8") as f:
+              f.write(html)
+
+          with open("web/_headers", "r", encoding="utf-8") as f:
+              headers = f.read()
+          headers = headers.replace("wss://*.koyeb.app", wss_origin)
+          with open("web/_headers", "w", encoding="utf-8") as f:
+              f.write(headers)
+          PY
+
+      - name: Deploy to Cloudflare Pages project "geistr"
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: pages deploy web --project-name=geistr

@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <meta name="geistr-relay-url" content="wss://geistr-relay.koyeb.app/ws">
+  <title>geistr — Zero-Trace MLS Chat</title>
+  <link rel="stylesheet" href="./style.css">
+</head>
+<body>
+  <main class="shell">
+    <header class="topbar">
+      <div class="brand">
+        <h1>geistr</h1>
+        <span class="badge" id="mls-badge">MLS RFC 9420 · Classical (v1)</span>
+      </div>
+      <div class="status-line" id="status-line" role="status" aria-live="polite">Initializing worker...</div>
+    </header>
+
+    <!-- Privacy Shield shown when tab/app is hidden or reconnecting -->
+    <section id="shield-view" class="card hidden" aria-live="assertive">
+      <h2>Session hidden</h2>
+      <p id="shield-reason">The visible history has been cleared. Deadlines and membership will be re-verified when you return.</p>
+    </section>
+
+    <!-- Landing / Create Room View -->
+    <section id="landing-view" class="card">
+      <h2>Create a zero-trace room</h2>
+      <p class="hint">Up to 4 participants (1 admin + 3 guests). End-to-end encrypted with MLS (RFC 9420). No accounts, no server history, no browser storage.</p>
+
+      <div class="field-row">
+        <label for="create-msg-ttl">Message lifetime</label>
+        <select id="create-msg-ttl">
+          <option value="300">5 minutes</option>
+          <option value="1800" selected>30 minutes (default)</option>
+          <option value="3600">1 hour</option>
+        </select>
+      </div>
+
+      <div class="field-row">
+        <label for="create-room-ttl">Room lifetime</label>
+        <select id="create-room-ttl">
+          <option value="300">5 minutes</option>
+          <option value="1800">30 minutes</option>
+          <option value="3600" selected>1 hour (default)</option>
+        </select>
+      </div>
+
+      <details class="relay-config">
+        <summary>Relay connection &amp; browser MLS verification</summary>
+        <div class="field-row">
+          <label for="relay-url-input">Relay WSS endpoint</label>
+          <input id="relay-url-input" type="url" autocomplete="off" spellcheck="false">
+        </div>
+        <div class="actions-inline">
+          <button type="button" id="btn-mls-selftest" class="secondary">Run browser MLS self-test</button>
+          <span id="selftest-output" class="mono small" role="status" aria-live="polite"></span>
+        </div>
+      </details>
+
+      <div class="actions">
+        <button type="button" id="btn-create-room" class="primary">Create room</button>
+      </div>
+    </section>
+
+    <!-- Pending Join View -->
+    <section id="pending-view" class="card hidden" aria-live="polite">
+      <h2>Joining room...</h2>
+      <p id="pending-text">Waiting for automatic admission by the room admin and verification of the admin identity.</p>
+      <button type="button" id="btn-cancel-join" class="secondary">Cancel</button>
+    </section>
+
+    <!-- Active Chat View -->
+    <section id="chat-view" class="hidden">
+      <div class="room-meta card">
+        <div class="meta-grid">
+          <div>
+            <span class="label">Room ID</span>
+            <span id="meta-room-id" class="mono"></span>
+          </div>
+          <div>
+            <span class="label">MLS Epoch</span>
+            <span id="meta-epoch" class="mono">0</span>
+          </div>
+          <div>
+            <span class="label">Room expires in</span>
+            <span id="meta-room-countdown" class="mono">--:--</span>
+          </div>
+          <div>
+            <span class="label">Message lifetime</span>
+            <span id="meta-msg-ttl" class="mono">30m</span>
+          </div>
+        </div>
+
+        <div class="members-box">
+          <span class="label">Participants (<span id="member-count">0</span>/4)</span>
+          <ul id="member-list" class="member-list"></ul>
+        </div>
+
+        <!-- Admin Controls -->
+        <div id="admin-controls" class="admin-panel hidden">
+          <div class="admin-row">
+            <button type="button" id="btn-generate-invite" class="primary">Generate one-time link</button>
+            <button type="button" id="btn-panic-wipe" class="danger">Panic-Wipe (Close now)</button>
+          </div>
+
+          <div id="invite-output-box" class="invite-box hidden">
+            <label for="invite-link-output" class="label">One-time invite link (fragment contains no group keys)</label>
+            <div class="invite-copy-row">
+              <input id="invite-link-output" type="text" readonly class="mono">
+              <button type="button" id="btn-copy-invite" class="secondary">Copy</button>
+            </div>
+          </div>
+
+          <div class="admin-policy-row">
+            <label for="live-msg-ttl">Message:</label>
+            <select id="live-msg-ttl">
+              <option value="300">5m</option>
+              <option value="1800">30m</option>
+              <option value="3600">1h</option>
+            </select>
+            <label for="live-room-ttl">Room:</label>
+            <select id="live-room-ttl">
+              <option value="300">5m</option>
+              <option value="1800">30m</option>
+              <option value="3600">1h</option>
+            </select>
+            <button type="button" id="btn-apply-policy" class="secondary">Apply lifetimes</button>
+          </div>
+        </div>
+
+        <div class="room-footer-actions">
+          <button type="button" id="btn-leave-room" class="secondary">Leave room</button>
+        </div>
+      </div>
+
+      <div id="pause-banner" class="banner warning hidden" role="alert">
+        Messaging is paused until the membership change completes in the new MLS epoch.
+      </div>
+
+      <section class="messages-card card" aria-label="Chat history">
+        <ol id="message-list" class="message-list" aria-live="polite"></ol>
+      </section>
+
+      <form id="composer-form" class="composer" autocomplete="off">
+        <label for="message-input" class="sr-only">Enter message</label>
+        <input id="message-input" type="text" maxlength="4000" placeholder="Encrypted message..." autocomplete="off" spellcheck="false">
+        <button type="submit" id="btn-send" class="primary">Send</button>
+      </form>
+    </section>
+
+    <!-- Ended / Wiped View -->
+    <section id="ended-view" class="card hidden" aria-live="assertive">
+      <h2 id="ended-title">Session ended</h2>
+      <p id="ended-reason"></p>
+      <button type="button" id="btn-restart" class="primary">Back to start</button>
+    </section>
+
+    <div id="error-toast" class="banner error hidden" role="alert"></div>
+  </main>
+
+  <script type="module" src="./app.js"></script>
+</body>
+</html>
