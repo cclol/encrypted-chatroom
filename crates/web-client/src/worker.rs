@@ -1009,7 +1009,16 @@ fn handle_ui_command(state: &Rc<RefCell<WorkerState>>, cmd: UiToWorker) {
                     emit_state(&st);
                     return;
                 } else if !st.is_epoch_synced() {
-                    // Remain shielded until MLS epoch synchronization finishes.
+                    // Bound the wait even when a pending MLS change prevents a verification request.
+                    if let Some(timers) = st.timers.clone() {
+                        let scope = st.scope.clone();
+                        arm_timeout(
+                            &scope,
+                            &mut st.verify_timer_id,
+                            &timers.verify_cb,
+                            VISIBILITY_VERIFY_TIMEOUT_MS,
+                        );
+                    }
                     return;
                 } else {
                     let Ok(check_id) = random_token_b64url(12) else {
@@ -1408,7 +1417,10 @@ fn on_wipe_timeout(state: &Rc<RefCell<WorkerState>>) {
 fn on_visibility_verify_timeout(state: &Rc<RefCell<WorkerState>>) {
     let mut st = state.borrow_mut();
     st.verify_timer_id = None;
-    if st.phase == Phase::Active && st.pending_visibility_check.is_some() {
+    if st.phase == Phase::Active
+        && st.ui_visible
+        && st.verified_visibility_token != Some(st.visibility_token)
+    {
         st.pending_visibility_check = None;
         st.ws_generation = st.ws_generation.wrapping_add(1);
         if let Some(ws) = st.ws.take() {
@@ -2288,6 +2300,16 @@ fn handle_relay_message(state: &Rc<RefCell<WorkerState>>, msg: RelayToClient) {
             messaging_paused,
         } => {
             let mut st = state.borrow_mut();
+            // An earlier foreground check may complete after another visibility transition.
+            // Only the matching response may cancel the current check's timeout.
+            if !st.ui_visible
+                || !st
+                    .pending_visibility_check
+                    .as_ref()
+                    .is_some_and(|(token, id)| *token == st.visibility_token && *id == check_id)
+            {
+                return;
+            }
             let scope = st.scope.clone();
             clear_timer(&scope, &mut st.verify_timer_id);
             let now = now_ms();
