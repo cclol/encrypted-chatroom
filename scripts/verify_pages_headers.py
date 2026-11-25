@@ -20,7 +20,11 @@ def verify_headers(pages_base_url: str, raw_relay_wss_url: str) -> None:
 
     for path in paths:
         url = f"{base}{path}"
-        req = urllib.request.Request(url, method="HEAD")
+        req = urllib.request.Request(
+            url,
+            method="HEAD",
+            headers={"User-Agent": "Mozilla/5.0 (compatible; Geistr-Pages-Header-Check/1.0)"},
+        )
         with urllib.request.urlopen(req, timeout=15) as resp:
             if resp.status != 200:
                 raise RuntimeError(f"{url} returned HTTP {resp.status}")
