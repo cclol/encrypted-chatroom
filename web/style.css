@@ -630,6 +630,18 @@ button.small-btn {
   margin-top: 0.65rem;
 }
 
+.invite-validity-hint {
+  margin: 0.4rem 0 0;
+}
+
+.invite-validity-hint.is-copied {
+  color: #a6f2c4;
+}
+
+.invite-validity-hint.is-expired {
+  color: #ffb3ba;
+}
+
 /* Panic-Wipe intentionally separated from frequent actions */
 .danger-zone {
   margin-top: 1.35rem;

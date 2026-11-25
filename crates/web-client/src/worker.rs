@@ -10,7 +10,7 @@ use core_crypto::admin::{
 };
 use core_crypto::ephemeral_store::{EphemeralHistoryStore, VisibleMessage};
 use core_crypto::mls::{MlsIncomingEvent, MlsSelftestReport, MlsSession, run_mls_selftest};
-use core_crypto::policy::{RECONNECT_GRACE_SECS, RoomPolicy};
+use core_crypto::policy::{INVITE_HOLD_MAX_SECS, RECONNECT_GRACE_SECS, RoomPolicy};
 use core_crypto::protocol::{
     ChatAppPayload, ClientToRelay, MemberSummary, MissedCommit, ParticipantRole, RelayToClient,
 };
@@ -21,7 +21,7 @@ use wasm_bindgen::prelude::*;
 use web_sys::{DedicatedWorkerGlobalScope, MessageEvent, WebSocket};
 use zeroize::{Zeroize, Zeroizing};
 
-const JOIN_RETRY_DEADLINE_MS: u64 = 30_000;
+const JOIN_RETRY_DEADLINE_MS: u64 = 60_000;
 const PANIC_WIPE_CONFIRM_TIMEOUT_MS: i32 = 4_000;
 const VISIBILITY_VERIFY_TIMEOUT_MS: i32 = 5_000;
 const RESUME_HANDSHAKE_TIMEOUT_MS: i32 = 8_000;
@@ -269,6 +269,7 @@ struct WorkerState {
     status_text: String,
 
     pending_invites: HashMap<String, PendingInvite>,
+    active_invite_expires_at_ms: Option<u64>,
     history: EphemeralHistoryStore,
     reconnect_attempts: u32,
     reconnect_deadline_ms: Option<u64>,
@@ -349,6 +350,7 @@ pub fn start() {
         messaging_paused: false,
         status_text: "Ready".into(),
         pending_invites: HashMap::new(),
+        active_invite_expires_at_ms: None,
         history: EphemeralHistoryStore::default(),
         reconnect_attempts: 0,
         reconnect_deadline_ms: None,
@@ -520,6 +522,7 @@ fn wipe_session_state(st: &mut WorkerState, new_phase: Phase, status: &str, clos
     }
     st.pending_join = None;
     st.pending_invites.clear();
+    st.active_invite_expires_at_ms = None;
     st.pending_action = None;
     st.pending_visibility_check = None;
     st.verified_visibility_token = None;
@@ -971,65 +974,76 @@ fn handle_ui_command(state: &Rc<RefCell<WorkerState>>, cmd: UiToWorker) {
         UiToWorker::UiVisible { visibility_token } => {
             // Section 6: Keep UI shielded until fresh server verification of room, deadline,
             // membership, and MLS epoch completes for THIS visibility transition!
-            let mut st = state.borrow_mut();
-            let now = now_ms();
-            st.ui_visible = true;
-            st.visibility_token = visibility_token;
-            st.verified_visibility_token = None;
-            st.pending_visibility_check = None;
+            let should_reconnect_now = {
+                let mut st = state.borrow_mut();
+                let now = now_ms();
+                st.ui_visible = true;
+                st.visibility_token = visibility_token;
+                st.verified_visibility_token = None;
+                st.pending_visibility_check = None;
 
-            if st.room_expires_at_ms > 0 && now >= st.room_expires_at_ms {
-                wipe_session_state(&mut st, Phase::Ended, "Room lifetime expired.", true);
-                return;
-            }
-            if let Some(deadline) = st.reconnect_deadline_ms
-                && now >= deadline
-            {
-                wipe_session_state(
-                    &mut st,
-                    Phase::Ended,
-                    "60-second reconnect window expired.",
-                    true,
-                );
-                return;
-            }
+                if st.room_expires_at_ms > 0 && now >= st.room_expires_at_ms {
+                    wipe_session_state(&mut st, Phase::Ended, "Room lifetime expired.", true);
+                    return;
+                }
+                if let Some(deadline) = st.reconnect_deadline_ms
+                    && now >= deadline
+                {
+                    wipe_session_state(&mut st, Phase::Ended, "Reconnect window expired.", true);
+                    return;
+                }
 
-            if st.phase != Phase::Active {
-                // Remain shielded / in current non-active view; never release history.
-                emit_state(&st);
-                return;
-            }
-            if !st.is_epoch_synced() {
-                // Remain shielded until MLS epoch synchronization finishes.
-                return;
-            }
-
-            let Ok(check_id) = random_token_b64url(12) else {
-                return;
+                if st.phase == Phase::Reconnecting {
+                    // Remain shielded while immediately attempting to resume (avoid waiting on a background-throttled timer).
+                    let scope = st.scope.clone();
+                    clear_timer(&scope, &mut st.reconnect_timer_id);
+                    emit_state(&st);
+                    if st.ws.is_none() {
+                        st.pending_action = Some(PendingConnectAction::Resume);
+                        true
+                    } else {
+                        false
+                    }
+                } else if st.phase != Phase::Active {
+                    // Remain shielded / in current non-active view; never release history.
+                    emit_state(&st);
+                    return;
+                } else if !st.is_epoch_synced() {
+                    // Remain shielded until MLS epoch synchronization finishes.
+                    return;
+                } else {
+                    let Ok(check_id) = random_token_b64url(12) else {
+                        return;
+                    };
+                    let local_epoch = st.local_epoch();
+                    if send_ws(
+                        &st,
+                        &ClientToRelay::VerifySession {
+                            check_id: check_id.clone(),
+                            local_epoch,
+                        },
+                    )
+                    .is_err()
+                    {
+                        // Socket unavailable -> move into Reconnecting while keeping shield up.
+                        enter_reconnecting_from_active(&mut st);
+                        return;
+                    }
+                    st.pending_visibility_check = Some((visibility_token, check_id));
+                    if let Some(timers) = st.timers.clone() {
+                        let scope = st.scope.clone();
+                        arm_timeout(
+                            &scope,
+                            &mut st.verify_timer_id,
+                            &timers.verify_cb,
+                            VISIBILITY_VERIFY_TIMEOUT_MS,
+                        );
+                    }
+                    false
+                }
             };
-            let local_epoch = st.local_epoch();
-            if send_ws(
-                &st,
-                &ClientToRelay::VerifySession {
-                    check_id: check_id.clone(),
-                    local_epoch,
-                },
-            )
-            .is_err()
-            {
-                // Socket unavailable -> move into Reconnecting while keeping shield up.
-                enter_reconnecting_from_active(&mut st);
-                return;
-            }
-            st.pending_visibility_check = Some((visibility_token, check_id));
-            if let Some(timers) = st.timers.clone() {
-                let scope = st.scope.clone();
-                arm_timeout(
-                    &scope,
-                    &mut st.verify_timer_id,
-                    &timers.verify_cb,
-                    VISIBILITY_VERIFY_TIMEOUT_MS,
-                );
+            if should_reconnect_now {
+                open_websocket(state);
             }
         }
     }
@@ -1145,9 +1159,25 @@ fn enter_reconnecting_from_active(st: &mut WorkerState) {
         }
     }
 
-    // Set absolute 60s reconnect deadline and attempt ID ONCE when entering Reconnecting!
+    // Set absolute reconnect deadline and attempt ID ONCE when entering Reconnecting!
+    // Admin with a valid open invite matches the relay's up-to-5-minute invite-hold window,
+    // always capped at remaining invite validity and original room expiry.
+    let normal_deadline = now.saturating_add(RECONNECT_GRACE_SECS.saturating_mul(1000));
+    let invite_hold_deadline = if st.role == Some(ParticipantRole::Admin) {
+        st.active_invite_expires_at_ms
+            .filter(|&exp| now < exp)
+            .map(|exp| {
+                now.saturating_add(INVITE_HOLD_MAX_SECS.saturating_mul(1000))
+                    .min(exp)
+            })
+    } else {
+        None
+    };
+    let extended_for_invite = invite_hold_deadline.is_some_and(|d| d > normal_deadline);
     if st.reconnect_deadline_ms.is_none() {
-        let grace_deadline = now.saturating_add(RECONNECT_GRACE_SECS.saturating_mul(1000));
+        let grace_deadline = invite_hold_deadline
+            .map(|d| d.max(normal_deadline))
+            .unwrap_or(normal_deadline);
         let capped = if st.room_expires_at_ms > 0 {
             grace_deadline.min(st.room_expires_at_ms)
         } else {
@@ -1160,7 +1190,11 @@ fn enter_reconnecting_from_active(st: &mut WorkerState) {
     }
 
     st.phase = Phase::Reconnecting;
-    st.status_text = "Connection interrupted — attempting to reconnect (60s window)...".into();
+    st.status_text = if extended_for_invite {
+        "Connection interrupted — attempting to reconnect while invite is active...".into()
+    } else {
+        "Connection interrupted — attempting to reconnect (60s window)...".into()
+    };
     post_to_ui(
         &st.scope,
         &WorkerToUi::ClearDisplay {
@@ -1190,7 +1224,7 @@ fn schedule_reconnect_timer(st: &mut WorkerState) {
                 wipe_session_state(
                     st,
                     Phase::Ended,
-                    "60-second reconnect window expired. Please request a new invite link.",
+                    "Reconnect window expired. Please start a new room or request a new invite link.",
                     true,
                 );
                 return;
@@ -1332,12 +1366,7 @@ fn on_reconnect_timer(state: &Rc<RefCell<WorkerState>>) {
                     wipe_session_state(&mut st, Phase::Ended, "Room lifetime expired.", true);
                     false
                 } else if st.reconnect_deadline_ms.is_some_and(|d| now >= d) {
-                    wipe_session_state(
-                        &mut st,
-                        Phase::Ended,
-                        "60-second reconnect window expired.",
-                        true,
-                    );
+                    wipe_session_state(&mut st, Phase::Ended, "Reconnect window expired.", true);
                     false
                 } else {
                     true
@@ -1494,12 +1523,7 @@ fn open_websocket(state: &Rc<RefCell<WorkerState>>) {
                 if let Some(deadline) = st.reconnect_deadline_ms
                     && now >= deadline
                 {
-                    wipe_session_state(
-                        &mut st,
-                        Phase::Ended,
-                        "60-second reconnect window expired.",
-                        true,
-                    );
+                    wipe_session_state(&mut st, Phase::Ended, "Reconnect window expired.", true);
                     return;
                 }
                 if let (Some(room_id), Some(participant_id), Some(resume_token), Some(attempt_id)) = (
@@ -1874,6 +1898,15 @@ fn handle_relay_message(state: &Rc<RefCell<WorkerState>>, msg: RelayToClient) {
             expires_at_ms,
         } => {
             let mut st = state.borrow_mut();
+            let capped_exp = if st.room_expires_at_ms > 0 {
+                expires_at_ms.min(st.room_expires_at_ms)
+            } else {
+                expires_at_ms
+            };
+            st.active_invite_expires_at_ms = Some(
+                st.active_invite_expires_at_ms
+                    .map_or(capped_exp, |prev| prev.max(capped_exp)),
+            );
             if let Some(inv) = st.pending_invites.remove(&token_hash_hex)
                 && let (Some(room_id), Some(key)) =
                     (st.room_id.clone(), st.admin_signing_key.as_ref())
@@ -1884,7 +1917,7 @@ fn handle_relay_message(state: &Rc<RefCell<WorkerState>>, msg: RelayToClient) {
                         room_id,
                         invite_token: inv.token.clone(),
                         admin_fingerprint: key.fingerprint(),
-                        expires_at_ms,
+                        expires_at_ms: capped_exp,
                     },
                 );
                 // `inv` drops here and zeroizes `inv.token`.
@@ -2440,6 +2473,9 @@ fn handle_relay_message(state: &Rc<RefCell<WorkerState>>, msg: RelayToClient) {
             let effective_expires = room_expires_at_ms.min(computed);
             st.policy = new_policy;
             st.room_expires_at_ms = effective_expires;
+            if let Some(inv_exp) = &mut st.active_invite_expires_at_ms {
+                *inv_exp = (*inv_exp).min(effective_expires);
+            }
             st.history
                 .apply_policy_change(new_policy.msg_ttl_secs, effective_expires, now);
             if now >= effective_expires {

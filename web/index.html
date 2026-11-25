@@ -7,7 +7,7 @@
   <meta name="referrer" content="no-referrer">
   <meta name="geistr-relay-url" content="wss://geistr-relay.onrender.com/ws">
   <title>geistr — Zero-Trace MLS Chat</title>
-  <link rel="stylesheet" href="./style.css?v=chat-viewport-1">
+  <link rel="stylesheet" href="./style.css?v=invite-hold-1">
 </head>
 <body>
   <main class="shell" id="app-shell">
@@ -166,6 +166,7 @@
               <input id="invite-link-output" type="text" readonly class="mono">
               <button type="button" id="btn-copy-invite" class="secondary">Copy</button>
             </div>
+            <p id="invite-validity-hint" class="invite-validity-hint small muted" role="status" aria-live="polite"></p>
           </div>
 
           <!-- Rarely used lifetime settings collapsed by default -->
@@ -248,6 +249,6 @@
     <div id="error-toast" class="banner error toast hidden" role="alert"></div>
   </main>
 
-  <script type="module" src="./app.js?v=chat-viewport-1"></script>
+  <script type="module" src="./app.js?v=invite-hold-1"></script>
 </body>
 </html>

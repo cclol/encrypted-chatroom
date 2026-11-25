@@ -49,6 +49,7 @@ const els = {
   btnPanicWipe: document.getElementById("btn-panic-wipe"),
   inviteOutputBox: document.getElementById("invite-output-box"),
   inviteLinkOutput: document.getElementById("invite-link-output"),
+  inviteValidityHint: document.getElementById("invite-validity-hint"),
   btnCopyInvite: document.getElementById("btn-copy-invite"),
   liveMsgTtl: document.getElementById("live-msg-ttl"),
   liveRoomTtl: document.getElementById("live-room-ttl"),
@@ -114,8 +115,29 @@ function checkRuntimeSupport() {
   }
 }
 
+// Detect if Safari/browser discarded and reloaded this tab while an admin session was active.
+// Uses only an ephemeral, secret-free boolean in history.state (no persistent browser storage).
+const hadUnloadedAdminSession = Boolean(
+  window.history.state && window.history.state.geistrActiveAdminSession,
+);
+
+function setAdminTabMarker(active) {
+  try {
+    window.history.replaceState(
+      active ? { geistrActiveAdminSession: true } : null,
+      "",
+      window.location.pathname,
+    );
+  } catch {
+    // Ignore history state restrictions.
+  }
+}
+
 // Mutable so invite credentials are released immediately after handoff to the Worker (Finding 7).
 let pendingInvite = extractAndStripInviteFragment();
+if (hadUnloadedAdminSession) {
+  setAdminTabMarker(false);
+}
 const openedViaInvite = Boolean(pendingInvite && pendingInvite.valid);
 els.relayUrlInput.value =
   (pendingInvite && pendingInvite.valid && pendingInvite.relayOverride) || defaultRelayUrl();
@@ -135,6 +157,8 @@ let countdownTimerId = null;
 let worker = null;
 let unreadWhileScrolledUp = 0;
 let baseViewportHeight = window.innerHeight || 0;
+let currentInviteExpiresAtMs = 0;
+let inviteCopiedUntilMs = 0;
 
 function clearPendingInviteMemory() {
   if (!pendingInvite) return;
@@ -164,12 +188,38 @@ function updateEmptyChatHint() {
   els.btnQuickInvite.classList.toggle("hidden", !showQuickInvite);
 }
 
+function updateInviteValidityHint() {
+  if (!els.inviteValidityHint) return;
+  if (!currentInviteExpiresAtMs || els.inviteOutputBox.classList.contains("hidden")) {
+    els.inviteValidityHint.textContent = "";
+    els.inviteValidityHint.className = "invite-validity-hint small muted";
+    return;
+  }
+  const now = Date.now();
+  if (now >= currentInviteExpiresAtMs) {
+    els.inviteValidityHint.textContent = "Invite link expired — generate a new link.";
+    els.inviteValidityHint.className = "invite-validity-hint small is-expired";
+    return;
+  }
+  const remaining = formatCountdown(currentInviteExpiresAtMs);
+  if (now < inviteCopiedUntilMs) {
+    els.inviteValidityHint.textContent = `Copied — invite valid for ${remaining}. Return to this tab to admit your guest.`;
+    els.inviteValidityHint.className = "invite-validity-hint small is-copied";
+  } else {
+    els.inviteValidityHint.textContent = `Invite valid for ${remaining}.`;
+    els.inviteValidityHint.className = "invite-validity-hint small muted";
+  }
+}
+
 function clearVisibleMessagesDom() {
   while (els.messageList.firstChild) {
     els.messageList.removeChild(els.messageList.firstChild);
   }
   els.inviteLinkOutput.value = "";
   els.inviteOutputBox.classList.add("hidden");
+  currentInviteExpiresAtMs = 0;
+  inviteCopiedUntilMs = 0;
+  updateInviteValidityHint();
   unreadWhileScrolledUp = 0;
   els.btnNewMessages.classList.add("hidden");
   setDrawerOpen(false);
@@ -195,6 +245,7 @@ function tickCountdowns() {
   if (currentState.roomExpiresAtMs > 0) {
     els.metaRoomCountdown.textContent = formatCountdown(currentState.roomExpiresAtMs);
   }
+  updateInviteValidityHint();
   for (const node of els.messageList.querySelectorAll(".msg-exp")) {
     const ts = Number(node.dataset.expiresAt || "0");
     if (ts > 0) {
@@ -263,12 +314,12 @@ function showUnsupportedBrowser(reasonDetail) {
 function configureShieldView(kind, reasonText) {
   els.shieldView.dataset.shieldKind = kind;
   if (kind === "reconnecting") {
-    els.shieldBadge.textContent = "Reconnecting (60s window)";
+    els.shieldBadge.textContent = "Reconnecting";
     els.shieldBadge.className = "status-pill pill-warn";
     els.shieldSpinner.classList.remove("hidden");
     els.shieldTitle.textContent = "Connection interrupted";
     els.shieldReason.textContent =
-      reasonText || "Attempting to reconnect within the 60-second grace window. History stays hidden until verified.";
+      reasonText || "Attempting to reconnect. History stays hidden until verified.";
   } else if (kind === "verifying") {
     els.shieldBadge.textContent = "Verifying session";
     els.shieldBadge.className = "status-pill pill-accent";
@@ -324,6 +375,13 @@ function configureEndedView(phase, statusText) {
     els.endedBadge.className = "status-pill pill-warn";
     els.endedTitle.textContent = "Cleared locally — room closure unconfirmed";
     els.endedReason.textContent = statusText;
+  } else if (phase === "tab_unloaded") {
+    els.endedBadge.textContent = "Admin session ended";
+    els.endedBadge.className = "status-pill pill-warn";
+    els.endedTitle.textContent = "Original admin session cannot be restored";
+    els.endedReason.textContent =
+      statusText ||
+      "Safari or your browser unloaded this tab in the background and cleared its temporary RAM. Because encryption keys are never saved to storage, the original admin session cannot be restored and open invites can no longer be admitted from this tab. Start a new room to continue.";
   } else {
     els.endedBadge.textContent = "Room ended";
     els.endedBadge.className = "status-pill pill-danger";
@@ -577,6 +635,9 @@ if (!runtimeSupport.ok) {
       "This invite link is incomplete or corrupted. Please ask the room admin for a fresh one-time invite link.",
     );
     showOnlyView("ended");
+  } else if (hadUnloadedAdminSession) {
+    configureEndedView("tab_unloaded");
+    showOnlyView("ended");
   }
 
   try {
@@ -683,7 +744,10 @@ if (worker) {
           fp: msg.admin_fingerprint,
         });
         els.inviteLinkOutput.value = `${base}#${frag.toString()}`;
+        currentInviteExpiresAtMs = msg.expires_at_ms || 0;
+        inviteCopiedUntilMs = 0;
         els.inviteOutputBox.classList.remove("hidden");
+        updateInviteValidityHint();
         setDrawerOpen(true);
         break;
       }
@@ -700,6 +764,7 @@ if (worker) {
         els.statusLine.textContent = msg.status_text || msg.phase;
 
         if (msg.phase === "idle") {
+          setAdminTabMarker(false);
           visibilityShieldLocked = false;
           clearVisibleMessagesDom();
           showOnlyView("landing");
@@ -718,6 +783,11 @@ if (worker) {
           showOnlyView("shield");
         } else if (msg.phase === "active") {
           const isAdmin = msg.role === "admin";
+          setAdminTabMarker(isAdmin);
+          if (currentInviteExpiresAtMs > 0 && msg.room_expires_at_ms > 0) {
+            currentInviteExpiresAtMs = Math.min(currentInviteExpiresAtMs, msg.room_expires_at_ms);
+            updateInviteValidityHint();
+          }
           const ttlLabel = formatTtl(msg.policy.msg_ttl_secs);
           els.metaRoomId.textContent = msg.room_id || "";
           els.metaEpoch.textContent = String(msg.epoch ?? 0);
@@ -747,6 +817,7 @@ if (worker) {
           msg.phase === "wiped_unconfirmed" ||
           msg.phase === "ended"
         ) {
+          setAdminTabMarker(false);
           visibilityShieldLocked = false;
           clearVisibleMessagesDom();
           configureEndedView(msg.phase, msg.status_text);
@@ -795,7 +866,7 @@ document.addEventListener("visibilitychange", () => {
       configureShieldView(
         currentState.phase === "reconnecting" ? "reconnecting" : "verifying",
         currentState.phase === "reconnecting"
-          ? "Connection interrupted — attempting to reconnect (60s window)…"
+          ? "Connection interrupted — attempting to reconnect…"
           : "Verifying room status, deadlines, and MLS epoch with relay…",
       );
       showOnlyView("shield");
@@ -841,12 +912,20 @@ els.btnCopyInvite.addEventListener("click", async () => {
   if (!els.inviteLinkOutput.value) return;
   try {
     await navigator.clipboard.writeText(els.inviteLinkOutput.value);
-    els.btnCopyInvite.textContent = "Copied";
+    const remaining =
+      currentInviteExpiresAtMs > Date.now()
+        ? formatCountdown(currentInviteExpiresAtMs)
+        : null;
+    els.btnCopyInvite.textContent = remaining ? `Copied (${remaining})` : "Copied";
+    inviteCopiedUntilMs = Date.now() + 8000;
+    updateInviteValidityHint();
     window.setTimeout(() => {
       els.btnCopyInvite.textContent = "Copy";
-    }, 1500);
+    }, 2500);
   } catch {
     els.inviteLinkOutput.select();
+    inviteCopiedUntilMs = Date.now() + 8000;
+    updateInviteValidityHint();
   }
 });
 
@@ -859,12 +938,14 @@ els.btnApplyPolicy.addEventListener("click", () => {
 });
 
 els.btnPanicWipe.addEventListener("click", () => {
+  setAdminTabMarker(false);
   els.messageInput.value = "";
   clearVisibleMessagesDom();
   sendWorker({ type: "panic_wipe" });
 });
 
 els.btnLeaveRoom.addEventListener("click", () => {
+  setAdminTabMarker(false);
   els.messageInput.value = "";
   clearVisibleMessagesDom();
   sendWorker({ type: "leave_room" });
@@ -877,6 +958,7 @@ els.btnCancelJoin.addEventListener("click", () => {
 });
 
 els.btnRestart.addEventListener("click", () => {
+  setAdminTabMarker(false);
   clearVisibleMessagesDom();
   showOnlyView("landing");
   els.statusLine.textContent = "Ready (WASM encryption active)";

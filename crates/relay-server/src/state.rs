@@ -236,6 +236,9 @@ struct Room {
     members: HashMap<String, MemberEntry>,
     invites: HashMap<String, InviteEntry>,
     pending_removals: HashSet<String>,
+    /// Fixed deadline for holding an empty room in RAM while a valid unconsumed invite exists.
+    /// Never extended by repeated join or resume attempts; cleared only on verified member resume.
+    empty_hold_deadline_ms: Option<u64>,
 }
 
 impl Room {
@@ -334,12 +337,68 @@ impl Room {
         self.members.len() + self.reserved_slot_count()
     }
 
-    fn connected_socket_count(&self) -> usize {
-        let member_connected = self
-            .members
+    fn max_open_invite_expiry_ms(&self, now: u64) -> Option<u64> {
+        self.invites
+            .values()
+            .filter(|inv| {
+                matches!(
+                    inv.state,
+                    InviteState::Unused | InviteState::Reserved { .. }
+                ) && now < inv.expires_at_ms
+            })
+            .map(|inv| inv.expires_at_ms)
+            .max()
+    }
+
+    fn admin_disconnect_deadline_ms(&self) -> Option<u64> {
+        match self.members.get(&self.admin_id).map(|m| &m.conn) {
+            Some(MemberConn::Disconnected { deadline_ms }) => Some(*deadline_ms),
+            _ => None,
+        }
+    }
+
+    fn is_hold_expired(&self, now: u64) -> bool {
+        if let Some(hold) = self.empty_hold_deadline_ms
+            && now >= hold
+        {
+            return true;
+        }
+        if let Some(admin_dl) = self.admin_disconnect_deadline_ms()
+            && now >= admin_dl
+        {
+            return true;
+        }
+        false
+    }
+
+    fn should_hold_empty(&self, now: u64) -> bool {
+        if now >= self.room_expires_at_ms {
+            return false;
+        }
+        let Some(hold_dl) = self.empty_hold_deadline_ms else {
+            return false;
+        };
+        if now >= hold_dl {
+            return false;
+        }
+        let Some(admin_dl) = self.admin_disconnect_deadline_ms() else {
+            return false;
+        };
+        if now >= admin_dl {
+            return false;
+        }
+        self.max_open_invite_expiry_ms(now).is_some()
+    }
+
+    fn connected_member_count(&self) -> usize {
+        self.members
             .values()
             .filter(|m| matches!(m.conn, MemberConn::Connected { .. }))
-            .count();
+            .count()
+    }
+
+    fn connected_socket_count(&self) -> usize {
+        let member_connected = self.connected_member_count();
         let guest_waiting = self
             .invites
             .values()
@@ -632,16 +691,26 @@ impl RelayState {
                         expires_at_ms,
                         ..
                     } => {
-                        if now >= *expires_at_ms || now >= inv.expires_at_ms {
+                        if now >= inv.expires_at_ms {
                             if let Some(gh) = guest_handle {
                                 gh.try_send_msg(&RelayToClient::Error {
-                                    code: "join_timeout".into(),
-                                    message: "Join reservation expired before admin responded"
-                                        .into(),
+                                    code: "invite_expired".into(),
+                                    message: "Invite link has expired".into(),
                                 });
                                 gh.close();
                             }
                             expired_invite_keys.push(token_hash.clone());
+                        } else if now >= *expires_at_ms {
+                            // Reservation timed out while invite is still valid and unused:
+                            // release the reserved slot and allow a retry with the same link.
+                            if let Some(gh) = guest_handle {
+                                gh.try_send_msg(&RelayToClient::Error {
+                                    code: "join_timeout".into(),
+                                    message: "Join reservation expired before admin responded. You can try again while the invite link is still valid.".into(),
+                                });
+                                gh.close();
+                            }
+                            inv.state = InviteState::Unused;
                         }
                     }
                     InviteState::Consumed { cached_welcome, .. } => {
@@ -706,8 +775,8 @@ impl RelayState {
                 );
             }
 
-            // 4. If 0 connected sockets remain after cleanup, terminate room immediately.
-            if room.connected_socket_count() == 0 {
+            // 4. If 0 connected sockets remain after cleanup, terminate room unless held for a valid open invite.
+            if room.connected_socket_count() == 0 && !room.should_hold_empty(now) {
                 rooms_to_close.push((room_id.clone(), "All participants disconnected".into()));
             }
         }
@@ -968,6 +1037,7 @@ impl RelayState {
                 members,
                 invites: HashMap::new(),
                 pending_removals: HashSet::new(),
+                empty_hold_deadline_ms: None,
             },
         );
 
@@ -1025,6 +1095,15 @@ impl RelayState {
         if now >= room.room_expires_at_ms {
             close_room_locked(&mut rooms, &room_id, "Room lifetime expired".into());
             send_err(handle, "room_expired", "Room has expired");
+            return;
+        }
+        if room.is_hold_expired(now) {
+            close_room_locked(
+                &mut rooms,
+                &room_id,
+                "Admin reconnect window expired".into(),
+            );
+            send_err(handle, "room_not_found", "Room does not exist or has ended");
             return;
         }
 
@@ -1131,13 +1210,73 @@ impl RelayState {
                 expires_at_ms,
                 forwarded_to_admin,
             } => {
-                if now >= *expires_at_ms || now >= invite.expires_at_ms {
+                if now >= invite.expires_at_ms {
                     if let Some(old_h) = guest_handle.take() {
                         old_h.close();
                     }
                     follow_up = JoinFollowUp::RemoveExpiredInvite {
-                        code: "join_timeout",
-                        message: "Join reservation expired",
+                        code: "invite_expired",
+                        message: "Invite link has expired",
+                    };
+                } else if now >= *expires_at_ms {
+                    // Previous reservation expired while the invite is still valid and unused:
+                    // release the stale reservation and allow this fresh attempt without extending any deadline.
+                    if let Some(old_h) = guest_handle.take() {
+                        old_h.try_send_msg(&RelayToClient::Error {
+                            code: "join_timeout".into(),
+                            message: "Join reservation expired before admin responded. You can try again while the invite link is still valid.".into(),
+                        });
+                        old_h.close();
+                    }
+                    let freed_slots = current_slots.saturating_sub(1);
+                    if freed_slots >= MAX_ROOM_MEMBERS {
+                        invite.state = InviteState::Unused;
+                        send_err(
+                            handle,
+                            "room_full",
+                            "Room already has the maximum of 4 participants",
+                        );
+                        return;
+                    }
+                    let Ok(new_res_id) = random_token_b64url(12) else {
+                        invite.state = InviteState::Unused;
+                        send_err(handle, "internal", "RNG failure");
+                        return;
+                    };
+                    let Ok(new_guest_id) = random_token_b64url(8) else {
+                        invite.state = InviteState::Unused;
+                        send_err(handle, "internal", "RNG failure");
+                        return;
+                    };
+                    let res_expiry = now
+                        .saturating_add(self.config.join_reservation_ttl_secs.saturating_mul(1000))
+                        .min(invite.expires_at_ms)
+                        .min(room.room_expires_at_ms);
+
+                    invite.state = InviteState::Reserved {
+                        reservation_id: new_res_id.clone(),
+                        guest_id: new_guest_id.clone(),
+                        client_join_nonce,
+                        key_package_b64: key_package_b64.clone(),
+                        guest_conn_id: Some(conn_id),
+                        guest_handle: Some(handle.clone()),
+                        expires_at_ms: res_expiry,
+                        forwarded_to_admin: false,
+                    };
+
+                    *binding = Some(ConnBinding {
+                        room_id: room_id.clone(),
+                        participant_id: new_guest_id.clone(),
+                        role: ParticipantRole::Guest,
+                        is_pending_reservation: true,
+                        reservation_token_hash: Some(token_hash.clone()),
+                    });
+
+                    follow_up = JoinFollowUp::ForwardToAdmin {
+                        reservation_id: new_res_id,
+                        guest_id: new_guest_id,
+                        key_package_b64,
+                        reason_is_retry: false,
                     };
                 } else if constant_time_eq_str(existing_nonce, &client_join_nonce)
                     && constant_time_eq_str(existing_kp, &key_package_b64)
@@ -1387,17 +1526,36 @@ impl RelayState {
             }
         };
         if reservation_expired {
-            if let Some(inv) = room.invites.remove(&token_hash)
-                && let InviteState::Reserved {
+            let invite_expired = room
+                .invites
+                .get(&token_hash)
+                .is_none_or(|inv| now >= inv.expires_at_ms);
+            if invite_expired {
+                if let Some(inv) = room.invites.remove(&token_hash)
+                    && let InviteState::Reserved {
+                        guest_handle: Some(gh),
+                        ..
+                    } = inv.state
+                {
+                    gh.try_send_msg(&RelayToClient::Error {
+                        code: "invite_expired".into(),
+                        message: "Invite link has expired".into(),
+                    });
+                    gh.close();
+                }
+            } else if let Some(inv) = room.invites.get_mut(&token_hash) {
+                let prev = std::mem::replace(&mut inv.state, InviteState::Unused);
+                if let InviteState::Reserved {
                     guest_handle: Some(gh),
                     ..
-                } = inv.state
-            {
-                gh.try_send_msg(&RelayToClient::Error {
-                    code: "join_timeout".into(),
-                    message: "Join reservation expired before admin responded".into(),
-                });
-                gh.close();
+                } = prev
+                {
+                    gh.try_send_msg(&RelayToClient::Error {
+                        code: "join_timeout".into(),
+                        message: "Join reservation expired before admin responded. You can try again while the invite link is still valid.".into(),
+                    });
+                    gh.close();
+                }
             }
             send_err(
                 handle,
@@ -1583,6 +1741,15 @@ impl RelayState {
             send_err(handle, "room_expired", "Room has expired");
             return;
         }
+        if room.is_hold_expired(now) {
+            close_room_locked(
+                &mut rooms,
+                &room_id,
+                "Admin reconnect window expired".into(),
+            );
+            send_err(handle, "resume_expired", "Reconnect window expired");
+            return;
+        }
 
         // Validate epoch catch-up feasibility before mutating member state.
         let Some(missed_commits) = room.commits_since(last_epoch) else {
@@ -1662,6 +1829,8 @@ impl RelayState {
             conn_id,
             handle: handle.clone(),
         };
+        // Verified member resume ends any empty-room invite hold window.
+        room.empty_hold_deadline_ms = None;
 
         *binding = Some(ConnBinding {
             room_id: room_id.clone(),
@@ -1975,7 +2144,10 @@ impl RelayState {
                     return;
                 }
 
-                // Cap existing invites & caches at the updated room expiry.
+                // Cap existing invites, caches, and any empty-hold deadline at the updated room expiry.
+                if let Some(hold) = &mut room.empty_hold_deadline_ms {
+                    *hold = (*hold).min(new_expires);
+                }
                 for inv in room.invites.values_mut() {
                     inv.expires_at_ms = inv.expires_at_ms.min(new_expires);
                     match &mut inv.state {
@@ -2345,19 +2517,24 @@ impl RelayState {
         let Some(b) = binding.take() else {
             return;
         };
+        let now = self.current_time_ms();
         let mut rooms = self.rooms.lock().await;
         let Some(room) = rooms.get_mut(&b.room_id) else {
             return;
         };
 
-        // Explicit cancel of a pending reservation removes the reservation & invite cleanly.
+        // Explicit cancel of a pending reservation releases the slot back to Unused while the invite is still valid.
         if !room.members.contains_key(&b.participant_id) {
             if let Some(hash) = b.reservation_token_hash
-                && let Some(inv) = room.invites.get(&hash)
+                && let Some(inv) = room.invites.get_mut(&hash)
                 && matches!(inv.state, InviteState::Reserved { guest_conn_id: Some(cid), .. } if cid == conn_id)
             {
-                room.invites.remove(&hash);
-                if room.connected_socket_count() == 0 {
+                if now < inv.expires_at_ms {
+                    inv.state = InviteState::Unused;
+                } else {
+                    room.invites.remove(&hash);
+                }
+                if room.connected_socket_count() == 0 && !room.should_hold_empty(now) {
                     rooms.remove(&b.room_id);
                 }
             }
@@ -2370,14 +2547,14 @@ impl RelayState {
         }
 
         if b.role == ParticipantRole::Admin {
-            // Section 6: Admin leaves explicitly -> Room ends immediately!
+            // Section 6: Admin leaves explicitly -> Room ends immediately (even if invites are open)!
             close_room_locked(&mut rooms, &b.room_id, "Admin left the room".into());
             return;
         }
 
         // Guest leaves explicitly -> permanent removal -> pause messaging until Admin commits MLS Remove!
         room.members.remove(&b.participant_id);
-        if room.connected_socket_count() == 0 {
+        if room.connected_socket_count() == 0 && !room.should_hold_empty(now) {
             rooms.remove(&b.room_id);
             return;
         }
@@ -2413,6 +2590,7 @@ impl RelayState {
 
         // Pending reservation disconnect: DO NOT discard the reservation or invite!
         // Keep the reservation alive until its fixed expiry so the browser can retry with the same nonce.
+        // Never extend any room hold or admin resume deadline on guest disconnect.
         if !room.members.contains_key(&b.participant_id) {
             if let Some(ref hash) = b.reservation_token_hash
                 && let Some(inv) = room.invites.get_mut(hash)
@@ -2425,7 +2603,7 @@ impl RelayState {
             {
                 *guest_conn_id = None;
                 *guest_handle = None;
-                if room.connected_socket_count() == 0 {
+                if room.connected_socket_count() == 0 && !room.should_hold_empty(now) {
                     rooms.remove(&b.room_id);
                 }
             }
@@ -2434,13 +2612,15 @@ impl RelayState {
 
         let mut was_active_conn = false;
         let was_paused = room.messaging_paused();
+        let normal_deadline = now
+            .saturating_add(self.config.reconnect_grace_secs.saturating_mul(1000))
+            .min(room.room_expires_at_ms);
         if let Some(member) = room.members.get_mut(&b.participant_id)
             && matches!(member.conn, MemberConn::Connected { conn_id: cid, .. } if cid == conn_id)
         {
             was_active_conn = true;
             member.conn = MemberConn::Disconnected {
-                deadline_ms: now
-                    .saturating_add(self.config.reconnect_grace_secs.saturating_mul(1000)),
+                deadline_ms: normal_deadline,
             };
         }
 
@@ -2448,11 +2628,70 @@ impl RelayState {
             return;
         }
 
-        // Section 6: When the last WebSocket disconnects, terminate the room immediately.
-        // The 60-second reconnect grace period only applies while at least one other socket remains open.
-        if room.connected_socket_count() == 0 {
+        // If Admin disconnected with any uncompleted Reserved invites, allow them to be
+        // re-forwarded upon verified Admin resume (in case the previous socket was half-open).
+        if b.role == ParticipantRole::Admin {
+            for inv in room.invites.values_mut() {
+                if let InviteState::Reserved {
+                    forwarded_to_admin, ..
+                } = &mut inv.state
+                {
+                    *forwarded_to_admin = false;
+                }
+            }
+        }
+
+        // When no admitted members remain connected (even if waiting guests are still attached):
+        // - If a valid, unconsumed invite exists, hold the room in Relay RAM for up to
+        //   `invite_hold_max_secs` (5 min), capped at the remaining invite validity and original room
+        //   expiry, and use the exact same deadline for the admin's resume window.
+        // - Never extend an already-established empty-room hold deadline.
+        // - If no valid unconsumed invite exists, terminate the room immediately as before.
+        if room.connected_member_count() == 0 {
+            if let Some(max_invite_exp) = room.max_open_invite_expiry_ms(now) {
+                let candidate_hold = now
+                    .saturating_add(self.config.invite_hold_max_secs.saturating_mul(1000))
+                    .min(max_invite_exp)
+                    .min(room.room_expires_at_ms);
+
+                let hold_deadline = match room.empty_hold_deadline_ms {
+                    Some(existing) => existing.min(max_invite_exp).min(room.room_expires_at_ms),
+                    None => candidate_hold,
+                };
+
+                let admin_alive = match room.members.get_mut(&room.admin_id) {
+                    Some(admin) => match &mut admin.conn {
+                        MemberConn::Disconnected { deadline_ms } if now < *deadline_ms => {
+                            if room.empty_hold_deadline_ms.is_none() {
+                                *deadline_ms = hold_deadline;
+                            } else {
+                                *deadline_ms = (*deadline_ms).min(hold_deadline);
+                            }
+                            now < *deadline_ms
+                        }
+                        _ => false,
+                    },
+                    None => false,
+                };
+
+                if admin_alive && now < hold_deadline {
+                    room.empty_hold_deadline_ms = Some(hold_deadline);
+                    info!(
+                        room_id = %b.room_id,
+                        hold_deadline_ms = hold_deadline,
+                        waiting_guests = room.connected_socket_count(),
+                        "last member disconnected with open invite; holding room in RAM for admin resume"
+                    );
+                    return;
+                }
+            }
+
             info!(room_id = %b.room_id, "last WebSocket disconnected; terminating room immediately");
-            rooms.remove(&b.room_id);
+            close_room_locked(
+                &mut rooms,
+                &b.room_id,
+                "All participants disconnected".into(),
+            );
             return;
         }
 

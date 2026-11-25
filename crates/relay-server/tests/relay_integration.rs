@@ -1488,3 +1488,510 @@ async fn slow_consumer_budget_overflow_terminates_only_slow_socket_while_others_
         RelayToClient::Pong { ts_ms: 42 }
     ));
 }
+
+#[tokio::test]
+async fn invite_hold_survives_admin_disconnect_beyond_60s_and_admits_waiting_guest_on_verified_resume()
+ {
+    let cfg = RelayConfig {
+        invite_ttl_secs: 300,
+        invite_hold_max_secs: 300,
+        reconnect_grace_secs: 60,
+        join_reservation_ttl_secs: 60,
+        ..Default::default()
+    };
+    let (url, state, clock) = spawn_test_relay_with_clock(cfg, 10_000_000, false).await;
+    let (mut admin_ws, room_id, admin_id, admin_resume, mut admin_key, mut admin_mls) =
+        create_initialized_room(&url).await;
+    let admin_pk = admin_key.verifying_key_bytes();
+    let admin_fp = admin_key.fingerprint();
+
+    // Admin registers an invite valid for 5 minutes, then disconnects (e.g. switches to Signal/WhatsApp).
+    let invite_token = register_invite(&mut admin_ws, &mut admin_key, 0).await;
+    admin_ws.close(None).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    assert_eq!(
+        state.active_room_count().await,
+        1,
+        "room with valid unused invite must stay in Relay RAM after last socket drops"
+    );
+
+    // Advance clock 90 seconds (> 60s normal reconnect window!) and run sweeper.
+    clock.fetch_add(90_000, Ordering::SeqCst);
+    state.sweep_once().await;
+    assert_eq!(
+        state.active_room_count().await,
+        1,
+        "room must still be held after 90s while invite is valid"
+    );
+
+    // Guest opens the invite link while admin is offline -> receives JoinPending ("waiting for admin").
+    let mut guest_ws = connect_ws(&url, "https://geistr.pages.dev").await.unwrap();
+    let mut guest_mls = MlsSession::new_guest(&room_id, "guest-wait").unwrap();
+    let guest_kp = STANDARD.encode(guest_mls.generate_key_package().unwrap());
+    send_msg(
+        &mut guest_ws,
+        &ClientToRelay::JoinRoom {
+            room_id: room_id.clone(),
+            invite_token,
+            key_package_b64: guest_kp,
+            client_join_nonce: "nonce-wait-1".into(),
+        },
+    )
+    .await;
+    match recv_msg(&mut guest_ws).await {
+        RelayToClient::JoinPending { reason, .. } => {
+            assert!(
+                reason.to_ascii_lowercase().contains("waiting for admin"),
+                "expected waiting-for-admin message, got: {reason}"
+            );
+        }
+        other => panic!("expected JoinPending while admin offline, got {other:?}"),
+    }
+
+    // Admin returns at t=95s (> 60s!) and resumes with the matching invite-hold deadline.
+    clock.fetch_add(5_000, Ordering::SeqCst);
+    let mut admin_ws2 = connect_ws(&url, "https://geistr.pages.dev").await.unwrap();
+    send_msg(
+        &mut admin_ws2,
+        &ClientToRelay::ResumeSession {
+            room_id: room_id.clone(),
+            participant_id: admin_id,
+            resume_token: admin_resume,
+            resume_attempt_id: "admin-resume-after-95s".into(),
+            last_epoch: 0,
+        },
+    )
+    .await;
+    match recv_msg(&mut admin_ws2).await {
+        RelayToClient::SessionResumed { epoch, .. } => assert_eq!(epoch, 0),
+        other => panic!("expected SessionResumed for admin, got {other:?}"),
+    }
+
+    // Relay immediately forwards the queued GuestJoinRequest to the resumed admin.
+    let (res_id, guest_id, kp_b64) = match recv_msg(&mut admin_ws2).await {
+        RelayToClient::GuestJoinRequest {
+            reservation_id,
+            guest_id,
+            key_package_b64,
+        } => (reservation_id, guest_id, key_package_b64),
+        other => panic!("expected queued GuestJoinRequest on admin resume, got {other:?}"),
+    };
+
+    let staged = admin_mls
+        .stage_add_member(&STANDARD.decode(&kp_b64).unwrap())
+        .unwrap();
+    send_msg(
+        &mut admin_ws2,
+        &ClientToRelay::CompleteJoin {
+            reservation_id: res_id,
+            guest_id,
+            commit_id: "admit-after-hold".into(),
+            expected_epoch: 0,
+            commit_b64: STANDARD.encode(&staged.commit_bytes),
+            welcome_b64: STANDARD.encode(&staged.welcome_bytes),
+            new_epoch: 1,
+        },
+    )
+    .await;
+
+    match recv_msg(&mut admin_ws2).await {
+        RelayToClient::CommitAccepted { new_epoch, .. } => assert_eq!(new_epoch, 1),
+        other => panic!("expected CommitAccepted, got {other:?}"),
+    }
+    admin_mls.apply_pending_commit().unwrap();
+
+    // Waiting guest receives JoinAccepted automatically and verifies MLS Welcome!
+    match recv_msg(&mut guest_ws).await {
+        RelayToClient::JoinAccepted {
+            welcome_b64,
+            epoch,
+            members,
+            ..
+        } => {
+            assert_eq!(epoch, 1);
+            assert_eq!(members.len(), 2);
+            let joined_ep = guest_mls
+                .join_from_welcome(
+                    &STANDARD.decode(&welcome_b64).unwrap(),
+                    &admin_pk,
+                    &admin_fp,
+                )
+                .unwrap();
+            assert_eq!(joined_ep, 1);
+        }
+        other => panic!("expected JoinAccepted for waiting guest, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn expired_reservation_releases_slot_for_retry_without_extending_any_deadline() {
+    let cfg = RelayConfig {
+        invite_ttl_secs: 300,
+        invite_hold_max_secs: 300,
+        reconnect_grace_secs: 60,
+        join_reservation_ttl_secs: 20,
+        ..Default::default()
+    };
+    let (url, state, clock) = spawn_test_relay_with_clock(cfg, 20_000_000, false).await;
+    let (mut admin_ws, room_id, admin_id, admin_resume, mut admin_key, _) =
+        create_initialized_room(&url).await;
+
+    let invite_token = register_invite(&mut admin_ws, &mut admin_key, 0).await;
+    admin_ws.close(None).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    assert_eq!(state.active_room_count().await, 1);
+
+    // At t=10s, guest 1 reserves the invite (reservation expires at t=30s).
+    clock.fetch_add(10_000, Ordering::SeqCst);
+    let mut g1_ws = connect_ws(&url, "https://geistr.pages.dev").await.unwrap();
+    let kp1 = STANDARD.encode(
+        MlsSession::new_guest(&room_id, "g1-retry")
+            .unwrap()
+            .generate_key_package()
+            .unwrap(),
+    );
+    send_msg(
+        &mut g1_ws,
+        &ClientToRelay::JoinRoom {
+            room_id: room_id.clone(),
+            invite_token: invite_token.clone(),
+            key_package_b64: kp1,
+            client_join_nonce: "nonce-r1".into(),
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv_msg(&mut g1_ws).await,
+        RelayToClient::JoinPending { .. }
+    ));
+
+    // Advance to t=35s (reservation expired, invite still valid until t=300s).
+    clock.fetch_add(25_000, Ordering::SeqCst);
+    state.sweep_once().await;
+    match recv_msg(&mut g1_ws).await {
+        RelayToClient::Error { code, .. } => assert_eq!(code, "join_timeout"),
+        other => panic!("expected join_timeout for expired reservation, got {other:?}"),
+    }
+    assert_eq!(
+        state.active_room_count().await,
+        1,
+        "room must remain held while invite is still valid and unused"
+    );
+
+    // At t=40s, guest retries with the EXACT SAME invite link -> slot was freed, retry succeeds!
+    clock.fetch_add(5_000, Ordering::SeqCst);
+    let mut g2_ws = connect_ws(&url, "https://geistr.pages.dev").await.unwrap();
+    let kp2 = STANDARD.encode(
+        MlsSession::new_guest(&room_id, "g2-retry")
+            .unwrap()
+            .generate_key_package()
+            .unwrap(),
+    );
+    send_msg(
+        &mut g2_ws,
+        &ClientToRelay::JoinRoom {
+            room_id: room_id.clone(),
+            invite_token: invite_token.clone(),
+            key_package_b64: kp2.clone(),
+            client_join_nonce: "nonce-r2".into(),
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv_msg(&mut g2_ws).await,
+        RelayToClient::JoinPending { .. }
+    ));
+    g2_ws.close(None).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    // Failed resume attempt at t=200s must NOT extend the original hold deadline (t=300s).
+    clock.fetch_add(160_000, Ordering::SeqCst);
+    let mut bad_resume_ws = connect_ws(&url, "https://geistr.pages.dev").await.unwrap();
+    send_msg(
+        &mut bad_resume_ws,
+        &ClientToRelay::ResumeSession {
+            room_id: room_id.clone(),
+            participant_id: admin_id.clone(),
+            resume_token: "wrong-token".into(),
+            resume_attempt_id: "bad-resume-1".into(),
+            last_epoch: 0,
+        },
+    )
+    .await;
+    match recv_msg(&mut bad_resume_ws).await {
+        RelayToClient::Error { code, .. } => assert_eq!(code, "invalid_resume_token"),
+        other => panic!("expected invalid_resume_token, got {other:?}"),
+    }
+
+    // Advance past original t=300s invite/hold deadline (t=301s, without sweeper!) -> MUST fail & close room!
+    clock.fetch_add(101_000, Ordering::SeqCst);
+    let mut late_admin_ws = connect_ws(&url, "https://geistr.pages.dev").await.unwrap();
+    send_msg(
+        &mut late_admin_ws,
+        &ClientToRelay::ResumeSession {
+            room_id: room_id.clone(),
+            participant_id: admin_id,
+            resume_token: admin_resume,
+            resume_attempt_id: "late-resume-after-301s".into(),
+            last_epoch: 0,
+        },
+    )
+    .await;
+    match recv_msg(&mut late_admin_ws).await {
+        RelayToClient::Error { code, .. } => assert_eq!(code, "resume_expired"),
+        other => panic!("expected resume_expired past hold deadline, got {other:?}"),
+    }
+    assert_eq!(state.active_room_count().await, 0);
+
+    // Expired invite link must also be rejected.
+    let mut late_guest_ws = connect_ws(&url, "https://geistr.pages.dev").await.unwrap();
+    send_msg(
+        &mut late_guest_ws,
+        &ClientToRelay::JoinRoom {
+            room_id,
+            invite_token,
+            key_package_b64: kp2,
+            client_join_nonce: "nonce-r3".into(),
+        },
+    )
+    .await;
+    match recv_msg(&mut late_guest_ws).await {
+        RelayToClient::Error { code, .. } => assert_eq!(code, "room_not_found"),
+        other => panic!("expected room_not_found after hold expiry, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn invite_hold_is_capped_at_room_expiry_and_panic_wipe_or_leave_ends_immediately() {
+    // Subcase A: Invite hold capped at original 5-minute room TTL.
+    let (url, state, clock) =
+        spawn_test_relay_with_clock(RelayConfig::default(), 30_000_000, false).await;
+
+    let mut admin_ws = connect_ws(&url, "https://geistr.pages.dev").await.unwrap();
+    let mut admin_key = AdminSigningKey::generate("pending").unwrap();
+    let short_policy = RoomPolicy::new(300, 300).unwrap(); // 5m room TTL
+    send_msg(
+        &mut admin_ws,
+        &ClientToRelay::CreateRoom {
+            admin_pubkey_b64: admin_key.verifying_key_b64(),
+            initial_policy: short_policy,
+        },
+    )
+    .await;
+    let (room_id, admin_id, admin_resume) = match recv_msg(&mut admin_ws).await {
+        RelayToClient::RoomCreated {
+            room_id,
+            participant_id,
+            resume_token,
+            ..
+        } => (room_id, participant_id, resume_token),
+        other => panic!("expected RoomCreated, got {other:?}"),
+    };
+    admin_key.rebind_room(&room_id);
+    let init_cmd = admin_key
+        .sign_command(
+            0,
+            AdminCommandPayload::SetPolicy {
+                msg_ttl_secs: 300,
+                room_ttl_secs: 300,
+            },
+        )
+        .unwrap();
+    send_msg(
+        &mut admin_ws,
+        &ClientToRelay::AdminCommand {
+            signed_cmd: init_cmd,
+        },
+    )
+    .await;
+    let _ = recv_msg(&mut admin_ws).await; // PolicyUpdated
+
+    // At t=240s, register a 300s invite (capped at room expiry t=300s) and disconnect.
+    clock.fetch_add(240_000, Ordering::SeqCst);
+    let _inv = register_invite(&mut admin_ws, &mut admin_key, 0).await;
+    admin_ws.close(None).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    assert_eq!(state.active_room_count().await, 1);
+
+    // At t=300s (room expiry), room MUST end even though only 60s elapsed since disconnect.
+    clock.fetch_add(60_000, Ordering::SeqCst);
+    let mut late_ws = connect_ws(&url, "https://geistr.pages.dev").await.unwrap();
+    send_msg(
+        &mut late_ws,
+        &ClientToRelay::ResumeSession {
+            room_id,
+            participant_id: admin_id,
+            resume_token: admin_resume,
+            resume_attempt_id: "capped-room-expiry".into(),
+            last_epoch: 0,
+        },
+    )
+    .await;
+    match recv_msg(&mut late_ws).await {
+        RelayToClient::Error { code, .. } => assert_eq!(code, "room_expired"),
+        other => panic!("expected room_expired, got {other:?}"),
+    }
+    assert_eq!(state.active_room_count().await, 0);
+
+    // Subcase B: Panic-Wipe ends room immediately despite an open unused invite!
+    let (mut admin_ws_b, room_id_b, _, _, mut admin_key_b, _) = create_initialized_room(&url).await;
+    let _inv_b = register_invite(&mut admin_ws_b, &mut admin_key_b, 0).await;
+    let wipe_cmd = admin_key_b
+        .sign_command(0, AdminCommandPayload::PanicWipe)
+        .unwrap();
+    send_msg(
+        &mut admin_ws_b,
+        &ClientToRelay::AdminCommand {
+            signed_cmd: wipe_cmd,
+        },
+    )
+    .await;
+    match recv_msg(&mut admin_ws_b).await {
+        RelayToClient::PanicWipeConfirmed { room_id } => assert_eq!(room_id, room_id_b),
+        other => panic!("expected PanicWipeConfirmed, got {other:?}"),
+    }
+    assert_eq!(
+        state.active_room_count().await,
+        0,
+        "PanicWipe must destroy room immediately even when unused invite exists"
+    );
+
+    // Subcase C: Explicit LeaveRoom by admin ends room immediately despite an open unused invite!
+    let (mut admin_ws_c, _, _, _, mut admin_key_c, _) = create_initialized_room(&url).await;
+    let _inv_c = register_invite(&mut admin_ws_c, &mut admin_key_c, 0).await;
+    send_msg(&mut admin_ws_c, &ClientToRelay::LeaveRoom).await;
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    assert_eq!(
+        state.active_room_count().await,
+        0,
+        "explicit admin LeaveRoom must destroy room immediately even when unused invite exists"
+    );
+}
+
+#[tokio::test]
+async fn waiting_guest_before_admin_disconnect_still_uses_invite_hold_deadline() {
+    let cfg = RelayConfig {
+        invite_ttl_secs: 300,
+        invite_hold_max_secs: 300,
+        reconnect_grace_secs: 60,
+        join_reservation_ttl_secs: 120,
+        ..Default::default()
+    };
+    let (url, state, clock) = spawn_test_relay_with_clock(cfg, 40_000_000, false).await;
+    let (mut admin_ws, room_id, admin_id, admin_resume, mut admin_key, mut admin_mls) =
+        create_initialized_room(&url).await;
+    let admin_pk = admin_key.verifying_key_bytes();
+    let admin_fp = admin_key.fingerprint();
+
+    let invite_token = register_invite(&mut admin_ws, &mut admin_key, 0).await;
+
+    // Guest opens the invite link BEFORE Safari drops the admin's WebSocket!
+    let mut guest_ws = connect_ws(&url, "https://geistr.pages.dev").await.unwrap();
+    let mut guest_mls = MlsSession::new_guest(&room_id, "guest-early").unwrap();
+    let guest_kp = STANDARD.encode(guest_mls.generate_key_package().unwrap());
+    send_msg(
+        &mut guest_ws,
+        &ClientToRelay::JoinRoom {
+            room_id: room_id.clone(),
+            invite_token,
+            key_package_b64: guest_kp,
+            client_join_nonce: "nonce-early-1".into(),
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv_msg(&mut guest_ws).await,
+        RelayToClient::JoinPending { .. }
+    ));
+    // GuestJoinRequest was sent to admin's backgrounded socket, which never completes it before closing.
+    assert!(matches!(
+        recv_msg(&mut admin_ws).await,
+        RelayToClient::GuestJoinRequest { .. }
+    ));
+
+    // Now admin's WebSocket drops while ONLY the waiting guest socket is still connected.
+    admin_ws.close(None).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    assert_eq!(state.active_room_count().await, 1);
+
+    // Advance clock 90 seconds (> 60s normal reconnect window!) and run sweeper.
+    // The waiting guest socket MUST NOT have forced the 60s normal window.
+    clock.fetch_add(90_000, Ordering::SeqCst);
+    state.sweep_once().await;
+    assert_eq!(
+        state.active_room_count().await,
+        1,
+        "room must survive >60s when only a waiting guest was connected at admin disconnect"
+    );
+
+    // Admin resumes at t=95s (> 60s!) -> receives SessionResumed AND re-forwarded GuestJoinRequest!
+    clock.fetch_add(5_000, Ordering::SeqCst);
+    let mut admin_ws2 = connect_ws(&url, "https://geistr.pages.dev").await.unwrap();
+    send_msg(
+        &mut admin_ws2,
+        &ClientToRelay::ResumeSession {
+            room_id: room_id.clone(),
+            participant_id: admin_id,
+            resume_token: admin_resume,
+            resume_attempt_id: "admin-resume-with-early-guest".into(),
+            last_epoch: 0,
+        },
+    )
+    .await;
+    match recv_msg(&mut admin_ws2).await {
+        RelayToClient::SessionResumed { epoch, .. } => assert_eq!(epoch, 0),
+        other => panic!("expected SessionResumed after >60s, got {other:?}"),
+    }
+
+    let (res_id, guest_id, kp_b64) = match recv_msg(&mut admin_ws2).await {
+        RelayToClient::GuestJoinRequest {
+            reservation_id,
+            guest_id,
+            key_package_b64,
+        } => (reservation_id, guest_id, key_package_b64),
+        other => panic!("expected re-forwarded GuestJoinRequest on admin resume, got {other:?}"),
+    };
+
+    let staged = admin_mls
+        .stage_add_member(&STANDARD.decode(&kp_b64).unwrap())
+        .unwrap();
+    send_msg(
+        &mut admin_ws2,
+        &ClientToRelay::CompleteJoin {
+            reservation_id: res_id,
+            guest_id,
+            commit_id: "admit-early-guest".into(),
+            expected_epoch: 0,
+            commit_b64: STANDARD.encode(&staged.commit_bytes),
+            welcome_b64: STANDARD.encode(&staged.welcome_bytes),
+            new_epoch: 1,
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv_msg(&mut admin_ws2).await,
+        RelayToClient::CommitAccepted { new_epoch: 1, .. }
+    ));
+    admin_mls.apply_pending_commit().unwrap();
+
+    match recv_msg(&mut guest_ws).await {
+        RelayToClient::JoinAccepted {
+            welcome_b64,
+            epoch,
+            members,
+            ..
+        } => {
+            assert_eq!(epoch, 1);
+            assert_eq!(members.len(), 2);
+            let joined_ep = guest_mls
+                .join_from_welcome(
+                    &STANDARD.decode(&welcome_b64).unwrap(),
+                    &admin_pk,
+                    &admin_fp,
+                )
+                .unwrap();
+            assert_eq!(joined_ep, 1);
+        }
+        other => panic!("expected JoinAccepted for early waiting guest, got {other:?}"),
+    }
+}

@@ -16,6 +16,10 @@ pub const MAX_ROOM_LIFETIME_SECS: u64 = 3600;
 /// Reconnect grace period when a participant disconnects while at least one other socket remains open.
 pub const RECONNECT_GRACE_SECS: u64 = 60;
 
+/// Maximum room retention & admin resume grace period after the last socket disconnects
+/// while at least one valid, unconsumed invite exists (capped at invite & room expiry).
+pub const INVITE_HOLD_MAX_SECS: u64 = 300;
+
 /// Hard maximum participants per room (1 admin + up to 3 guests).
 pub const MAX_ROOM_MEMBERS: usize = 4;
 
