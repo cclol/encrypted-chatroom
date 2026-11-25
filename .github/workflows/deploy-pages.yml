@@ -96,7 +96,7 @@ jobs:
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          command: pages deploy dist-web --project-name=geistr
+          command: pages deploy dist-web --project-name=geistr --branch=main
 
       - name: Verify live Pages security headers and exact CSP origin
         if: ${{ inputs.pages_url != '' }}
