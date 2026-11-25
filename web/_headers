@@ -12,3 +12,15 @@
 
 /index.html
   Cache-Control: no-store
+
+/app.js
+  Cache-Control: public, no-cache
+
+/style.css
+  Cache-Control: public, no-cache
+
+/worker.js
+  Cache-Control: public, no-cache
+
+/pkg/*
+  Cache-Control: public, no-cache
