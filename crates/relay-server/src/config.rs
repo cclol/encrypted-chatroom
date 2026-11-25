@@ -242,7 +242,12 @@ impl RelayConfig {
 
     pub fn is_origin_allowed(&self, origin: &str) -> bool {
         let normalized = origin.trim_end_matches('/');
-        if normalized == self.allowed_origin.trim_end_matches('/') {
+        if self
+            .allowed_origin
+            .split(',')
+            .map(|entry| entry.trim().trim_end_matches('/'))
+            .any(|entry| !entry.is_empty() && normalized == entry)
+        {
             return true;
         }
         if self.allow_localhost_dev {

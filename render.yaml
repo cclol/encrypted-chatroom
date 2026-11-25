@@ -10,7 +10,7 @@ services:
       - key: BIND_ADDR
         value: 0.0.0.0
       - key: ALLOWED_ORIGIN
-        value: https://geistr.pages.dev
+        value: "https://geistr.cc,https://www.geistr.cc,https://geistr.pages.dev"
       - key: ALLOW_LOCALHOST_DEV
         value: "false"
       - key: INVITE_TTL_SECS

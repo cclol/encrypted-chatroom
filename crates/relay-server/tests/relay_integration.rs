@@ -24,7 +24,6 @@ type WsStream =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 async fn spawn_test_relay(mut config: RelayConfig) -> (String, Arc<RelayState>) {
-    config.allowed_origin = "https://geistr.pages.dev".into();
     config.sweep_interval_ms = 50;
     config.wipe_delivery_grace_ms = 100;
     let state = RelayState::new(config);
@@ -328,8 +327,19 @@ async fn admit_guest(
 
 #[tokio::test]
 async fn origin_header_is_strictly_enforced() {
-    let (url, _) = spawn_test_relay(RelayConfig::default()).await;
+    let (url, _) = spawn_test_relay(RelayConfig {
+        allowed_origin: "https://geistr.cc, https://www.geistr.cc, https://geistr.pages.dev".into(),
+        ..RelayConfig::default()
+    })
+    .await;
     assert!(connect_ws(&url, "https://evil.example").await.is_err());
+    assert!(
+        connect_ws(&url, "https://www.geistr.cc.evil.example")
+            .await
+            .is_err()
+    );
+    assert!(connect_ws(&url, "https://geistr.cc").await.is_ok());
+    assert!(connect_ws(&url, "https://www.geistr.cc").await.is_ok());
     assert!(connect_ws(&url, "https://geistr.pages.dev").await.is_ok());
 }
 
