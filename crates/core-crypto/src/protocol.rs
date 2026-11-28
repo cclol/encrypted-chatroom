@@ -54,15 +54,25 @@ pub enum ClientToRelay {
     CreateRoom {
         admin_pubkey_b64: String,
         initial_policy: RoomPolicy,
+        #[serde(default)]
+        room_name: Option<String>,
     },
     /// Registers the initial signed policy command right after receiving `room_id` from `RoomCreated`.
-    /// Also used for all subsequent signed admin commands (SetPolicy, RegisterInvite, KickGuest, PanicWipe, CloseRoom).
+    /// Also used for all subsequent signed admin commands (SetPolicy, RegisterInvite, SetRoomCode, RevokeRoomCode, KickGuest, PanicWipe, CloseRoom).
     AdminCommand { signed_cmd: SignedAdminCommand },
     /// Joins an existing room with a one-time invite token and MLS KeyPackage.
     /// NEVER creates a room.
     JoinRoom {
         room_id: String,
         invite_token: String,
+        key_package_b64: String,
+        client_join_nonce: String,
+    },
+    /// Joins an existing room with a multi-use room code access secret and MLS KeyPackage.
+    /// NEVER creates a room.
+    JoinRoomWithCode {
+        room_id: String,
+        access_secret: String,
         key_package_b64: String,
         client_join_nonce: String,
     },
@@ -116,18 +126,27 @@ pub enum ClientToRelay {
 pub enum RelayToClient {
     RoomCreated {
         room_id: String,
+        #[serde(default)]
+        room_name: Option<String>,
         participant_id: String,
         resume_token: String,
         room_created_at_ms: u64,
         room_expires_at_ms: u64,
         policy: RoomPolicy,
         invite_ttl_secs: u64,
+        #[serde(default)]
+        room_code_ttl_secs: u64,
         keepalive_interval_secs: u64,
     },
     InviteRegistered {
         token_hash_hex: String,
         expires_at_ms: u64,
     },
+    RoomCodeUpdated {
+        secret_hash_hex: String,
+        expires_at_ms: u64,
+    },
+    RoomCodeRevoked,
     JoinPending {
         room_id: String,
         reason: String,
@@ -139,6 +158,8 @@ pub enum RelayToClient {
     },
     JoinAccepted {
         room_id: String,
+        #[serde(default)]
+        room_name: Option<String>,
         participant_id: String,
         resume_token: String,
         commit_id: String,
@@ -156,6 +177,8 @@ pub enum RelayToClient {
     },
     SessionResumed {
         room_id: String,
+        #[serde(default)]
+        room_name: Option<String>,
         participant_id: String,
         resume_token: String,
         conn_generation: u64,
@@ -167,6 +190,10 @@ pub enum RelayToClient {
         members: Vec<MemberSummary>,
         messaging_paused: bool,
         keepalive_interval_secs: u64,
+        #[serde(default)]
+        room_code_secret_hash_hex: Option<String>,
+        #[serde(default)]
+        room_code_expires_at_ms: Option<u64>,
     },
     /// Sent to Admin once the relay accepts and orders a staged Add or Remove Commit.
     CommitAccepted {

@@ -14,6 +14,7 @@ use core_crypto::policy::{ADMIN_RECONNECT_GRACE_SECS, RECONNECT_GRACE_SECS, Room
 use core_crypto::protocol::{
     ChatAppPayload, ClientToRelay, MemberSummary, MissedCommit, ParticipantRole, RelayToClient,
 };
+use core_crypto::room_code::{RoomCode, reconcile_room_code_on_resume, sanitize_room_name};
 use core_crypto::{random_token_b64url, sha256_hex};
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::JsCast;
@@ -27,6 +28,9 @@ const VISIBILITY_VERIFY_TIMEOUT_MS: i32 = 4_000;
 const RESUME_HANDSHAKE_TIMEOUT_MS: i32 = 8_000;
 const KEEPALIVE_LIVENESS_TIMEOUT_MS: u64 = 15_000;
 
+const ROOM_CODE_ERROR_CODE: &str = "invalid_room_code";
+const ROOM_CODE_ERROR_MSG: &str = "Room code is invalid, revoked, or the room has ended";
+
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum UiToWorker {
@@ -35,6 +39,8 @@ enum UiToWorker {
         relay_url: String,
         msg_ttl_secs: u64,
         room_ttl_secs: u64,
+        #[serde(default)]
+        room_name: Option<String>,
     },
     JoinRoom {
         relay_url: String,
@@ -42,7 +48,13 @@ enum UiToWorker {
         invite_token: String,
         admin_fingerprint: String,
     },
+    JoinWithRoomCode {
+        relay_url: String,
+        room_code: String,
+    },
     GenerateInvite,
+    GenerateRoomCode,
+    RevokeRoomCode,
     SendMessage {
         text: String,
     },
@@ -82,6 +94,7 @@ enum WorkerToUi {
     StateUpdate {
         phase: String,
         room_id: Option<String>,
+        room_name: Option<String>,
         participant_id: Option<String>,
         role: Option<ParticipantRole>,
         epoch: u64,
@@ -97,6 +110,11 @@ enum WorkerToUi {
         room_id: String,
         invite_token: String,
         admin_fingerprint: String,
+        expires_at_ms: u64,
+    },
+    RoomCodeState {
+        active: bool,
+        room_code: Option<String>,
         expires_at_ms: u64,
     },
     VisibilityVerified {
@@ -153,14 +171,31 @@ impl Phase {
 }
 
 enum PendingConnectAction {
-    Create { policy: RoomPolicy },
+    Create {
+        policy: RoomPolicy,
+        room_name: Option<String>,
+    },
     Join,
     Resume,
 }
 
+enum PendingJoinKind {
+    Invite { invite_token: String },
+    RoomCode { access_secret: String },
+}
+
+impl Drop for PendingJoinKind {
+    fn drop(&mut self) {
+        match self {
+            PendingJoinKind::Invite { invite_token } => invite_token.zeroize(),
+            PendingJoinKind::RoomCode { access_secret } => access_secret.zeroize(),
+        }
+    }
+}
+
 struct PendingJoinAttempt {
     room_id: String,
-    invite_token: String,
+    kind: PendingJoinKind,
     client_join_nonce: String,
     key_package_b64: String,
     deadline_ms: u64,
@@ -169,7 +204,6 @@ struct PendingJoinAttempt {
 impl Drop for PendingJoinAttempt {
     fn drop(&mut self) {
         self.room_id.zeroize();
-        self.invite_token.zeroize();
         self.client_join_nonce.zeroize();
         self.key_package_b64.zeroize();
         self.deadline_ms = 0;
@@ -249,6 +283,7 @@ struct WorkerState {
     pending_join: Option<PendingJoinAttempt>,
 
     room_id: Option<String>,
+    room_name: Option<String>,
     participant_id: Option<String>,
     role: Option<ParticipantRole>,
     resume_token: Option<String>,
@@ -269,6 +304,7 @@ struct WorkerState {
     room_created_at_ms: u64,
     room_expires_at_ms: u64,
     invite_ttl_secs: u64,
+    room_code_ttl_secs: u64,
     keepalive_interval_secs: u64,
     last_relay_activity_ms: u64,
     pending_ping_sent_at_ms: Option<u64>,
@@ -277,6 +313,8 @@ struct WorkerState {
     status_text: String,
 
     pending_invites: HashMap<String, PendingInvite>,
+    pending_room_codes: HashMap<String, RoomCode>,
+    active_room_code: Option<(RoomCode, u64)>,
     history: EphemeralHistoryStore,
     reconnect_attempts: u32,
     reconnect_deadline_ms: Option<u64>,
@@ -332,6 +370,7 @@ pub fn start() {
         pending_action: None,
         pending_join: None,
         room_id: None,
+        room_name: None,
         participant_id: None,
         role: None,
         resume_token: None,
@@ -350,6 +389,7 @@ pub fn start() {
         room_created_at_ms: 0,
         room_expires_at_ms: 0,
         invite_ttl_secs: 300,
+        room_code_ttl_secs: 900,
         keepalive_interval_secs: 20,
         last_relay_activity_ms: 0,
         pending_ping_sent_at_ms: None,
@@ -357,6 +397,8 @@ pub fn start() {
         messaging_paused: false,
         status_text: "Ready".into(),
         pending_invites: HashMap::new(),
+        pending_room_codes: HashMap::new(),
+        active_room_code: None,
         history: EphemeralHistoryStore::default(),
         reconnect_attempts: 0,
         reconnect_deadline_ms: None,
@@ -446,6 +488,7 @@ fn emit_state(st: &WorkerState) {
         &WorkerToUi::StateUpdate {
             phase: st.phase.as_str().into(),
             room_id: st.room_id.clone(),
+            room_name: st.room_name.clone(),
             participant_id: st.participant_id.clone(),
             role: st.role,
             epoch,
@@ -528,6 +571,9 @@ fn wipe_session_state(st: &mut WorkerState, new_phase: Phase, status: &str, clos
     }
     st.pending_join = None;
     st.pending_invites.clear();
+    st.pending_room_codes.clear();
+    st.active_room_code = None;
+    st.room_name = None;
     st.pending_action = None;
     st.pending_visibility_check = None;
     st.verified_visibility_token = None;
@@ -585,6 +631,7 @@ fn handle_ui_command(state: &Rc<RefCell<WorkerState>>, cmd: UiToWorker) {
             relay_url,
             msg_ttl_secs,
             room_ttl_secs,
+            room_name,
         } => {
             let policy = match RoomPolicy::new(msg_ttl_secs, room_ttl_secs) {
                 Ok(p) => p,
@@ -612,14 +659,19 @@ fn handle_ui_command(state: &Rc<RefCell<WorkerState>>, cmd: UiToWorker) {
                     return;
                 }
             };
+            let clean_name = sanitize_room_name(room_name.as_deref());
             {
                 let mut st = state.borrow_mut();
                 wipe_session_state(&mut st, Phase::Connecting, "Connecting to relay...", true);
                 st.relay_url = Some(relay_url);
                 st.role = Some(ParticipantRole::Admin);
                 st.policy = policy;
+                st.room_name = clean_name.clone();
                 st.admin_signing_key = Some(admin_key);
-                st.pending_action = Some(PendingConnectAction::Create { policy });
+                st.pending_action = Some(PendingConnectAction::Create {
+                    policy,
+                    room_name: clean_name,
+                });
                 emit_state(&st);
             }
             open_websocket(state);
@@ -627,86 +679,46 @@ fn handle_ui_command(state: &Rc<RefCell<WorkerState>>, cmd: UiToWorker) {
         UiToWorker::JoinRoom {
             relay_url,
             room_id,
-            mut invite_token,
+            invite_token,
             admin_fingerprint,
         } => {
-            let provisional_id = match random_token_b64url(8) {
-                Ok(id) => id,
-                Err(e) => {
-                    invite_token.zeroize();
+            start_guest_join(
+                state,
+                relay_url,
+                room_id,
+                PendingJoinKind::Invite { invite_token },
+                admin_fingerprint,
+            );
+        }
+        UiToWorker::JoinWithRoomCode {
+            relay_url,
+            mut room_code,
+        } => {
+            let parsed = RoomCode::parse(&room_code);
+            room_code.zeroize();
+            let parsed = match parsed {
+                Ok(c) => c,
+                Err(_) => {
                     post_to_ui(
                         &state.borrow().scope,
                         &WorkerToUi::Error {
-                            code: "rng_failed".into(),
-                            message: e.to_string(),
+                            code: ROOM_CODE_ERROR_CODE.into(),
+                            message: ROOM_CODE_ERROR_MSG.into(),
                         },
                     );
                     return;
                 }
             };
-            let client_join_nonce = match random_token_b64url(16) {
-                Ok(n) => n,
-                Err(e) => {
-                    invite_token.zeroize();
-                    post_to_ui(
-                        &state.borrow().scope,
-                        &WorkerToUi::Error {
-                            code: "rng_failed".into(),
-                            message: e.to_string(),
-                        },
-                    );
-                    return;
-                }
-            };
-            let mls = match MlsSession::new_guest(&room_id, &provisional_id) {
-                Ok(m) => m,
-                Err(e) => {
-                    invite_token.zeroize();
-                    post_to_ui(
-                        &state.borrow().scope,
-                        &WorkerToUi::Error {
-                            code: "mls_init_failed".into(),
-                            message: e.to_string(),
-                        },
-                    );
-                    return;
-                }
-            };
-            let kp_bytes = match mls.generate_key_package() {
-                Ok(kp) => kp,
-                Err(e) => {
-                    invite_token.zeroize();
-                    post_to_ui(
-                        &state.borrow().scope,
-                        &WorkerToUi::Error {
-                            code: "kp_failed".into(),
-                            message: e.to_string(),
-                        },
-                    );
-                    return;
-                }
-            };
-            let key_package_b64 = STANDARD.encode(&kp_bytes);
-
-            {
-                let mut st = state.borrow_mut();
-                wipe_session_state(&mut st, Phase::Connecting, "Joining room...", true);
-                st.relay_url = Some(relay_url);
-                st.room_id = Some(room_id.clone());
-                st.role = Some(ParticipantRole::Guest);
-                st.expected_admin_fingerprint = Some(admin_fingerprint);
-                st.mls = Some(mls);
-                st.pending_join = Some(PendingJoinAttempt {
-                    room_id,
-                    invite_token,
-                    client_join_nonce,
-                    key_package_b64,
-                    deadline_ms: now_ms().saturating_add(JOIN_RETRY_DEADLINE_MS),
-                });
-                st.pending_action = Some(PendingConnectAction::Join);
-                emit_state(&st);
-            }
-            open_websocket(state);
+            start_guest_join(
+                state,
+                relay_url,
+                parsed.room_id.clone(),
+                PendingJoinKind::RoomCode {
+                    access_secret: parsed.access_secret.clone(),
+                },
+                parsed.admin_fingerprint.clone(),
+            );
+            // `parsed` drops here and zeroizes its fields.
         }
         UiToWorker::GenerateInvite => {
             let mut st = state.borrow_mut();
@@ -746,6 +758,88 @@ fn handle_ui_command(state: &Rc<RefCell<WorkerState>>, cmd: UiToWorker) {
             };
             st.pending_invites
                 .insert(token_hash_hex, PendingInvite { token });
+            if let Err(e) = send_ws(&st, &ClientToRelay::AdminCommand { signed_cmd }) {
+                post_to_ui(
+                    &st.scope,
+                    &WorkerToUi::Error {
+                        code: "send_failed".into(),
+                        message: e,
+                    },
+                );
+            }
+        }
+        UiToWorker::GenerateRoomCode => {
+            let mut st = state.borrow_mut();
+            if st.phase != Phase::Active
+                || st.role != Some(ParticipantRole::Admin)
+                || !st.is_epoch_synced()
+            {
+                return;
+            }
+            let Some(room_id) = st.room_id.clone() else {
+                return;
+            };
+            let Ok(secret) = random_token_b64url(24) else {
+                return;
+            };
+            let epoch = st.local_epoch();
+            let ttl = st.room_code_ttl_secs;
+            let (code, secret_hash_hex, signed_cmd) = match st.admin_signing_key.as_mut() {
+                Some(key) => {
+                    let fp = key.fingerprint();
+                    let Ok(code) = RoomCode::new(&room_id, &secret, &fp) else {
+                        return;
+                    };
+                    let hash = code.secret_hash_hex();
+                    match key.sign_command(
+                        epoch,
+                        AdminCommandPayload::SetRoomCode {
+                            secret_hash_hex: hash.clone(),
+                            code_ttl_secs: ttl,
+                        },
+                    ) {
+                        Ok(c) => (code, hash, c),
+                        Err(e) => {
+                            post_to_ui(
+                                &st.scope,
+                                &WorkerToUi::Error {
+                                    code: "sign_failed".into(),
+                                    message: e.to_string(),
+                                },
+                            );
+                            return;
+                        }
+                    }
+                }
+                None => return,
+            };
+            st.pending_room_codes.insert(secret_hash_hex, code);
+            if let Err(e) = send_ws(&st, &ClientToRelay::AdminCommand { signed_cmd }) {
+                post_to_ui(
+                    &st.scope,
+                    &WorkerToUi::Error {
+                        code: "send_failed".into(),
+                        message: e,
+                    },
+                );
+            }
+        }
+        UiToWorker::RevokeRoomCode => {
+            let mut st = state.borrow_mut();
+            if st.phase != Phase::Active
+                || st.role != Some(ParticipantRole::Admin)
+                || !st.is_epoch_synced()
+            {
+                return;
+            }
+            let epoch = st.local_epoch();
+            let Some(key) = st.admin_signing_key.as_mut() else {
+                return;
+            };
+            let Ok(signed_cmd) = key.sign_command(epoch, AdminCommandPayload::RevokeRoomCode)
+            else {
+                return;
+            };
             if let Err(e) = send_ws(&st, &ClientToRelay::AdminCommand { signed_cmd }) {
                 post_to_ui(
                     &st.scope,
@@ -989,6 +1083,127 @@ fn handle_ui_command(state: &Rc<RefCell<WorkerState>>, cmd: UiToWorker) {
     }
 }
 
+fn start_guest_join(
+    state: &Rc<RefCell<WorkerState>>,
+    relay_url: String,
+    room_id: String,
+    kind: PendingJoinKind,
+    admin_fingerprint: String,
+) {
+    let provisional_id = match random_token_b64url(8) {
+        Ok(id) => id,
+        Err(e) => {
+            post_to_ui(
+                &state.borrow().scope,
+                &WorkerToUi::Error {
+                    code: "rng_failed".into(),
+                    message: e.to_string(),
+                },
+            );
+            return;
+        }
+    };
+    let client_join_nonce = match random_token_b64url(16) {
+        Ok(n) => n,
+        Err(e) => {
+            post_to_ui(
+                &state.borrow().scope,
+                &WorkerToUi::Error {
+                    code: "rng_failed".into(),
+                    message: e.to_string(),
+                },
+            );
+            return;
+        }
+    };
+    let mls = match MlsSession::new_guest(&room_id, &provisional_id) {
+        Ok(m) => m,
+        Err(e) => {
+            post_to_ui(
+                &state.borrow().scope,
+                &WorkerToUi::Error {
+                    code: "mls_init_failed".into(),
+                    message: e.to_string(),
+                },
+            );
+            return;
+        }
+    };
+    let kp_bytes = match mls.generate_key_package() {
+        Ok(kp) => kp,
+        Err(e) => {
+            post_to_ui(
+                &state.borrow().scope,
+                &WorkerToUi::Error {
+                    code: "kp_failed".into(),
+                    message: e.to_string(),
+                },
+            );
+            return;
+        }
+    };
+    let key_package_b64 = STANDARD.encode(&kp_bytes);
+
+    {
+        let mut st = state.borrow_mut();
+        wipe_session_state(&mut st, Phase::Connecting, "Joining room...", true);
+        st.relay_url = Some(relay_url);
+        st.room_id = Some(room_id.clone());
+        st.role = Some(ParticipantRole::Guest);
+        st.expected_admin_fingerprint = Some(admin_fingerprint);
+        st.mls = Some(mls);
+        st.pending_join = Some(PendingJoinAttempt {
+            room_id,
+            kind,
+            client_join_nonce,
+            key_package_b64,
+            deadline_ms: now_ms().saturating_add(JOIN_RETRY_DEADLINE_MS),
+        });
+        st.pending_action = Some(PendingConnectAction::Join);
+        emit_state(&st);
+    }
+    open_websocket(state);
+}
+
+fn emit_room_code_state(st: &mut WorkerState) {
+    if st.role != Some(ParticipantRole::Admin) || !st.can_render_now() {
+        return;
+    }
+    let now = now_ms();
+    if let Some((code, exp)) = &st.active_room_code {
+        if now >= *exp {
+            st.active_room_code = None;
+            post_to_ui(
+                &st.scope,
+                &WorkerToUi::RoomCodeState {
+                    active: false,
+                    room_code: None,
+                    expires_at_ms: 0,
+                },
+            );
+        } else {
+            let encoded = code.encode();
+            post_to_ui(
+                &st.scope,
+                &WorkerToUi::RoomCodeState {
+                    active: true,
+                    room_code: Some((*encoded).clone()),
+                    expires_at_ms: *exp,
+                },
+            );
+        }
+    } else {
+        post_to_ui(
+            &st.scope,
+            &WorkerToUi::RoomCodeState {
+                active: false,
+                room_code: None,
+                expires_at_ms: 0,
+            },
+        );
+    }
+}
+
 fn handle_session_check(
     state: &Rc<RefCell<WorkerState>>,
     visibility_token: u64,
@@ -1174,6 +1389,7 @@ fn render_full_if_verified(st: &mut WorkerState) {
             },
         );
     }
+    emit_room_code_state(st);
     schedule_next_expiry_timer(st);
 }
 
@@ -1558,11 +1774,12 @@ fn open_websocket(state: &Rc<RefCell<WorkerState>>) {
         // They are reset ONLY once SessionResumed / JoinAccepted actually succeeds.
         let action = st.pending_action.take();
         match action {
-            Some(PendingConnectAction::Create { policy }) => {
+            Some(PendingConnectAction::Create { policy, room_name }) => {
                 if let Some(key) = &st.admin_signing_key {
                     let msg = ClientToRelay::CreateRoom {
                         admin_pubkey_b64: key.verifying_key_b64(),
                         initial_policy: policy,
+                        room_name,
                     };
                     let _ = send_ws(&st, &msg);
                 }
@@ -1574,11 +1791,21 @@ fn open_websocket(state: &Rc<RefCell<WorkerState>>) {
                         wipe_session_state(&mut st, Phase::Ended, "Join attempt timed out.", true);
                         return;
                     }
-                    let msg = ClientToRelay::JoinRoom {
-                        room_id: pj.room_id.clone(),
-                        invite_token: pj.invite_token.clone(),
-                        key_package_b64: pj.key_package_b64.clone(),
-                        client_join_nonce: pj.client_join_nonce.clone(),
+                    let msg = match &pj.kind {
+                        PendingJoinKind::Invite { invite_token } => ClientToRelay::JoinRoom {
+                            room_id: pj.room_id.clone(),
+                            invite_token: invite_token.clone(),
+                            key_package_b64: pj.key_package_b64.clone(),
+                            client_join_nonce: pj.client_join_nonce.clone(),
+                        },
+                        PendingJoinKind::RoomCode { access_secret } => {
+                            ClientToRelay::JoinRoomWithCode {
+                                room_id: pj.room_id.clone(),
+                                access_secret: access_secret.clone(),
+                                key_package_b64: pj.key_package_b64.clone(),
+                                client_join_nonce: pj.client_join_nonce.clone(),
+                            }
+                        }
                     };
                     let _ = send_ws(&st, &msg);
                     let remaining = pj.deadline_ms.saturating_sub(now);
@@ -1899,22 +2126,28 @@ fn handle_relay_message(state: &Rc<RefCell<WorkerState>>, msg: RelayToClient) {
     match msg {
         RelayToClient::RoomCreated {
             room_id,
+            room_name,
             participant_id,
             resume_token,
             room_created_at_ms,
             room_expires_at_ms,
             policy,
             invite_ttl_secs,
+            room_code_ttl_secs,
             keepalive_interval_secs,
         } => {
             let mut st = state.borrow_mut();
             st.room_id = Some(room_id.clone());
+            st.room_name = room_name;
             st.participant_id = Some(participant_id.clone());
             st.resume_token = Some(resume_token);
             st.room_created_at_ms = room_created_at_ms;
             st.room_expires_at_ms = room_expires_at_ms;
             st.policy = policy;
             st.invite_ttl_secs = invite_ttl_secs;
+            if room_code_ttl_secs > 0 {
+                st.room_code_ttl_secs = room_code_ttl_secs;
+            }
             st.keepalive_interval_secs = keepalive_interval_secs;
             st.relay_epoch = 0;
             st.members = vec![MemberSummary {
@@ -1993,6 +2226,35 @@ fn handle_relay_message(state: &Rc<RefCell<WorkerState>>, msg: RelayToClient) {
                 );
                 // `inv` drops here and zeroizes `inv.token`.
             }
+        }
+        RelayToClient::RoomCodeUpdated {
+            secret_hash_hex,
+            expires_at_ms,
+        } => {
+            let mut st = state.borrow_mut();
+            let capped_exp = if st.room_expires_at_ms > 0 {
+                expires_at_ms.min(st.room_expires_at_ms)
+            } else {
+                expires_at_ms
+            };
+            if let Some(code) = st.pending_room_codes.remove(&secret_hash_hex) {
+                st.active_room_code = Some((code, capped_exp));
+                st.pending_room_codes.clear();
+                emit_room_code_state(&mut st);
+            }
+        }
+        RelayToClient::RoomCodeRevoked => {
+            let mut st = state.borrow_mut();
+            st.active_room_code = None;
+            st.pending_room_codes.clear();
+            post_to_ui(
+                &st.scope,
+                &WorkerToUi::RoomCodeState {
+                    active: false,
+                    room_code: None,
+                    expires_at_ms: 0,
+                },
+            );
         }
         RelayToClient::JoinPending { reason, .. } => {
             let mut st = state.borrow_mut();
@@ -2092,6 +2354,7 @@ fn handle_relay_message(state: &Rc<RefCell<WorkerState>>, msg: RelayToClient) {
         }
         RelayToClient::JoinAccepted {
             room_id,
+            room_name,
             participant_id,
             resume_token,
             commit_id,
@@ -2207,6 +2470,7 @@ fn handle_relay_message(state: &Rc<RefCell<WorkerState>>, msg: RelayToClient) {
             st.pending_join = None;
             st.reconnect_attempts = 0;
             st.admin_verifier = Some(verifier);
+            st.room_name = room_name;
             st.participant_id = Some(participant_id);
             st.resume_token = Some(resume_token);
             st.policy = verified_policy;
@@ -2239,6 +2503,7 @@ fn handle_relay_message(state: &Rc<RefCell<WorkerState>>, msg: RelayToClient) {
             render_full_if_verified(&mut st);
         }
         RelayToClient::SessionResumed {
+            room_name,
             resume_token,
             epoch,
             missed_commits,
@@ -2248,6 +2513,8 @@ fn handle_relay_message(state: &Rc<RefCell<WorkerState>>, msg: RelayToClient) {
             members,
             messaging_paused,
             keepalive_interval_secs,
+            room_code_secret_hash_hex,
+            room_code_expires_at_ms,
             ..
         } => {
             let mut st = state.borrow_mut();
@@ -2315,6 +2582,23 @@ fn handle_relay_message(state: &Rc<RefCell<WorkerState>>, msg: RelayToClient) {
                 st.room_expires_at_ms = room_expires_at_ms;
             }
 
+            st.room_name = room_name;
+            if st.role == Some(ParticipantRole::Admin) {
+                let room_exp = st.room_expires_at_ms;
+                let WorkerState {
+                    active_room_code,
+                    pending_room_codes,
+                    ..
+                } = &mut *st;
+                reconcile_room_code_on_resume(
+                    active_room_code,
+                    pending_room_codes,
+                    room_code_secret_hash_hex.as_deref(),
+                    room_code_expires_at_ms,
+                    room_exp,
+                    now,
+                );
+            }
             st.resume_token = Some(resume_token);
             st.reconnect_attempts = 0;
             st.reconnect_deadline_ms = None;
@@ -2554,6 +2838,9 @@ fn handle_relay_message(state: &Rc<RefCell<WorkerState>>, msg: RelayToClient) {
             let effective_expires = room_expires_at_ms.min(computed);
             st.policy = new_policy;
             st.room_expires_at_ms = effective_expires;
+            if let Some((_, code_exp)) = st.active_room_code.as_mut() {
+                *code_exp = (*code_exp).min(effective_expires);
+            }
             st.history
                 .apply_policy_change(new_policy.msg_ttl_secs, effective_expires, now);
             if now >= effective_expires {
@@ -2639,6 +2926,7 @@ fn handle_relay_message(state: &Rc<RefCell<WorkerState>>, msg: RelayToClient) {
                     | "resume_expired"
                     | "invalid_resume_token"
                     | "invalid_invite"
+                    | "invalid_room_code"
                     | "invite_expired"
                     | "invite_consumed"
                     | "invite_in_use"
@@ -2646,7 +2934,8 @@ fn handle_relay_message(state: &Rc<RefCell<WorkerState>>, msg: RelayToClient) {
                     | "join_timeout"
                     | "epoch_desync"
                     | "stale_connection"
-            );
+            ) || (code == "rate_limited"
+                && matches!(st.phase, Phase::Connecting | Phase::PendingJoin));
             // If an Admin staged commit was rejected (e.g. reservation_expired), clear pending commit cleanly!
             if matches!(
                 code.as_str(),

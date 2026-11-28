@@ -118,6 +118,10 @@ pub struct RelayConfig {
     pub trusted_proxy_cidrs: Vec<IpCidr>,
     /// Configurable one-time invite link lifetime in seconds (always capped at room expiry).
     pub invite_ttl_secs: u64,
+    /// Configurable multi-use room code lifetime in seconds (always capped at room expiry).
+    pub room_code_ttl_secs: u64,
+    /// Load limit: maximum failed room-code join attempts per IP per 60 seconds.
+    pub max_failed_room_code_joins_per_ip_per_min: usize,
     /// Configurable WebSocket keep-alive ping interval in seconds (separate from the 60s reconnect window).
     pub keepalive_interval_secs: u64,
     /// Maximum seconds to wait for a pong/frame before declaring a socket dead.
@@ -166,6 +170,8 @@ impl Default for RelayConfig {
             allow_localhost_dev: false,
             trusted_proxy_cidrs: Vec::new(),
             invite_ttl_secs: 300,
+            room_code_ttl_secs: 900,
+            max_failed_room_code_joins_per_ip_per_min: 10,
             keepalive_interval_secs: 20,
             keepalive_timeout_secs: 15,
             ws_write_timeout_secs: 10,
@@ -210,6 +216,13 @@ impl RelayConfig {
             cfg.trusted_proxy_cidrs = v.split(',').filter_map(IpCidr::parse).collect();
         }
         cfg.invite_ttl_secs = parse_env_u64("INVITE_TTL_SECS", cfg.invite_ttl_secs).clamp(30, 3600);
+        cfg.room_code_ttl_secs =
+            parse_env_u64("ROOM_CODE_TTL_SECS", cfg.room_code_ttl_secs).clamp(30, 3600);
+        cfg.max_failed_room_code_joins_per_ip_per_min = parse_env_usize(
+            "MAX_FAILED_ROOM_CODE_JOINS_PER_IP_PER_MIN",
+            cfg.max_failed_room_code_joins_per_ip_per_min,
+        )
+        .max(1);
         cfg.keepalive_interval_secs =
             parse_env_u64("KEEPALIVE_INTERVAL_SECS", cfg.keepalive_interval_secs).clamp(5, 120);
         cfg.keepalive_timeout_secs =

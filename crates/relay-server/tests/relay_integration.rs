@@ -11,11 +11,12 @@ use core_crypto::admin::{
 use core_crypto::mls::{MlsIncomingEvent, MlsSession};
 use core_crypto::policy::RoomPolicy;
 use core_crypto::protocol::{ChatAppPayload, ClientToRelay, RelayToClient};
+use core_crypto::room_code::{RoomCode, reconcile_room_code_on_resume};
 use core_crypto::{random_token_b64url, sha256_hex};
 use futures_util::{SinkExt, StreamExt};
 use relay_server::build_router;
 use relay_server::config::RelayConfig;
-use relay_server::state::{RelayState, now_ms};
+use relay_server::state::{ROOM_CODE_ERROR_CODE, ROOM_CODE_ERROR_MSG, RelayState, now_ms};
 use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -118,6 +119,7 @@ async fn create_initialized_room(
         &ClientToRelay::CreateRoom {
             admin_pubkey_b64: admin_key.verifying_key_b64(),
             initial_policy: policy,
+            room_name: None,
         },
     )
     .await;
@@ -1844,6 +1846,7 @@ async fn invite_hold_is_capped_at_room_expiry_and_panic_wipe_or_leave_ends_immed
         &ClientToRelay::CreateRoom {
             admin_pubkey_b64: admin_key.verifying_key_b64(),
             initial_policy: short_policy,
+            room_name: None,
         },
     )
     .await;
@@ -2063,4 +2066,953 @@ async fn waiting_guest_before_admin_disconnect_still_uses_invite_hold_deadline()
         }
         other => panic!("expected JoinAccepted for early waiting guest, got {other:?}"),
     }
+}
+
+async fn set_room_code(
+    admin_ws: &mut WsStream,
+    admin_key: &mut AdminSigningKey,
+    room_id: &str,
+    epoch: u64,
+    ttl_secs: u64,
+) -> (RoomCode, u64) {
+    let secret = random_token_b64url(24).unwrap();
+    let code = RoomCode::new(room_id, &secret, admin_key.fingerprint()).unwrap();
+    let cmd = admin_key
+        .sign_command(
+            epoch,
+            AdminCommandPayload::SetRoomCode {
+                secret_hash_hex: code.secret_hash_hex(),
+                code_ttl_secs: ttl_secs,
+            },
+        )
+        .unwrap();
+    send_msg(admin_ws, &ClientToRelay::AdminCommand { signed_cmd: cmd }).await;
+    let expires_at_ms = match recv_msg(admin_ws).await {
+        RelayToClient::RoomCodeUpdated {
+            secret_hash_hex,
+            expires_at_ms,
+        } => {
+            assert_eq!(secret_hash_hex, code.secret_hash_hex());
+            expires_at_ms
+        }
+        other => panic!("expected RoomCodeUpdated, got {other:?}"),
+    };
+    (code, expires_at_ms)
+}
+
+async fn admit_guest_with_code(
+    url: &str,
+    encoded_code: &str,
+    admin_ws: &mut WsStream,
+    admin_mls: &mut MlsSession,
+    existing_guests: &mut [(&mut WsStream, &mut MlsSession)],
+    expected_epoch: u64,
+) -> (WsStream, String, String, MlsSession) {
+    let parsed = RoomCode::parse(encoded_code).unwrap();
+    let mut guest_ws = connect_ws(url, "https://geistr.pages.dev").await.unwrap();
+    let provisional = random_token_b64url(8).unwrap();
+    let mut guest_mls = MlsSession::new_guest(&parsed.room_id, &provisional).unwrap();
+    let kp_b64 = STANDARD.encode(guest_mls.generate_key_package().unwrap());
+    let nonce = random_token_b64url(16).unwrap();
+
+    send_msg(
+        &mut guest_ws,
+        &ClientToRelay::JoinRoomWithCode {
+            room_id: parsed.room_id.clone(),
+            access_secret: parsed.access_secret.clone(),
+            key_package_b64: kp_b64,
+            client_join_nonce: nonce,
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv_msg(&mut guest_ws).await,
+        RelayToClient::JoinPending { .. }
+    ));
+
+    let (res_id, guest_id, guest_kp_b64) = match recv_msg(admin_ws).await {
+        RelayToClient::GuestJoinRequest {
+            reservation_id,
+            guest_id,
+            key_package_b64,
+        } => (reservation_id, guest_id, key_package_b64),
+        other => panic!("expected GuestJoinRequest, got {other:?}"),
+    };
+
+    let staged = admin_mls
+        .stage_add_member(&STANDARD.decode(&guest_kp_b64).unwrap())
+        .unwrap();
+    assert_eq!(staged.expected_epoch, expected_epoch);
+    let new_epoch = staged.new_epoch;
+    let commit_id = format!("code-commit-{new_epoch}");
+
+    send_msg(
+        admin_ws,
+        &ClientToRelay::CompleteJoin {
+            reservation_id: res_id,
+            guest_id: guest_id.clone(),
+            commit_id: commit_id.clone(),
+            expected_epoch,
+            commit_b64: STANDARD.encode(&staged.commit_bytes),
+            welcome_b64: STANDARD.encode(&staged.welcome_bytes),
+            new_epoch,
+        },
+    )
+    .await;
+
+    assert!(matches!(
+        recv_msg(admin_ws).await,
+        RelayToClient::CommitAccepted { new_epoch: ep, .. } if ep == new_epoch
+    ));
+    admin_mls.apply_pending_commit().unwrap();
+    send_msg(
+        admin_ws,
+        &ClientToRelay::AckCommit {
+            commit_id: commit_id.clone(),
+            epoch: new_epoch,
+        },
+    )
+    .await;
+
+    for (ews, emls) in existing_guests.iter_mut() {
+        match recv_msg(ews).await {
+            RelayToClient::MlsCommit {
+                commit_b64,
+                epoch,
+                commit_id: cid,
+                ..
+            } => {
+                assert_eq!(epoch, new_epoch);
+                let ev = emls
+                    .process_incoming(&STANDARD.decode(&commit_b64).unwrap())
+                    .unwrap();
+                assert!(matches!(
+                    ev,
+                    MlsIncomingEvent::EpochAdvanced { new_epoch: ep } if ep == new_epoch
+                ));
+                send_msg(
+                    ews,
+                    &ClientToRelay::AckCommit {
+                        commit_id: cid,
+                        epoch: new_epoch,
+                    },
+                )
+                .await;
+            }
+            other => panic!("expected MlsCommit for existing guest, got {other:?}"),
+        }
+    }
+
+    let (resume_token, welcome_b64, admin_pk_b64) = match recv_msg(&mut guest_ws).await {
+        RelayToClient::JoinAccepted {
+            participant_id,
+            resume_token,
+            welcome_b64,
+            admin_pubkey_b64,
+            epoch,
+            ..
+        } => {
+            assert_eq!(participant_id, guest_id);
+            assert_eq!(epoch, new_epoch);
+            (resume_token, welcome_b64, admin_pubkey_b64)
+        }
+        other => panic!("expected JoinAccepted, got {other:?}"),
+    };
+
+    let admin_pk = core_crypto::admin::decode_pubkey_b64(&admin_pk_b64).unwrap();
+    assert_eq!(
+        compute_admin_fingerprint(&admin_pk, &parsed.room_id),
+        parsed.admin_fingerprint
+    );
+    let joined_ep = guest_mls
+        .join_from_welcome(
+            &STANDARD.decode(&welcome_b64).unwrap(),
+            &admin_pk,
+            &parsed.admin_fingerprint,
+        )
+        .unwrap();
+    assert_eq!(joined_ep, new_epoch);
+
+    send_msg(
+        &mut guest_ws,
+        &ClientToRelay::AckCommit {
+            commit_id,
+            epoch: new_epoch,
+        },
+    )
+    .await;
+
+    (guest_ws, guest_id, resume_token, guest_mls)
+}
+
+#[tokio::test]
+async fn room_code_admits_multiple_guests_and_enforces_max_three_guests_even_in_parallel() {
+    let (url, _state) = spawn_test_relay(RelayConfig::default()).await;
+    let (mut admin_ws, room_id, _admin_id, _admin_resume, mut admin_key, mut admin_mls) =
+        create_initialized_room(&url).await;
+
+    let (code, _exp) = set_room_code(&mut admin_ws, &mut admin_key, &room_id, 0, 900).await;
+    let encoded = code.encode();
+
+    // Guest 1 joins with the room code.
+    let (mut g1_ws, _g1_id, _g1_res, mut g1_mls) =
+        admit_guest_with_code(&url, &encoded, &mut admin_ws, &mut admin_mls, &mut [], 0).await;
+
+    // Admin sends a message before Guest 2 joins; Guest 2 must NOT receive prior history.
+    let early_msg = ChatAppPayload {
+        message_id: "early-secret".into(),
+        text: "before guest 2".into(),
+        sent_at_ms: now_ms(),
+    };
+    let ct = admin_mls.encrypt_chat_message(&early_msg).unwrap();
+    send_msg(
+        &mut admin_ws,
+        &ClientToRelay::SendMlsMessage {
+            epoch: 1,
+            message_id: early_msg.message_id.clone(),
+            ciphertext_b64: STANDARD.encode(&ct),
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv_msg(&mut g1_ws).await,
+        RelayToClient::MlsMessage { .. }
+    ));
+
+    // Guest 2 joins with the SAME room code.
+    let (mut g2_ws, _g2_id, _g2_res, mut g2_mls) = admit_guest_with_code(
+        &url,
+        &encoded,
+        &mut admin_ws,
+        &mut admin_mls,
+        &mut [(&mut g1_ws, &mut g1_mls)],
+        1,
+    )
+    .await;
+
+    // Verify Guest 2 receives no buffered prior history.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(120), g2_ws.next())
+            .await
+            .is_err(),
+        "new guest must not receive prior messages"
+    );
+
+    // Now 3 guests attempt to join in parallel with the same room code.
+    // Only 1 slot remains (1 admin + 2 guests = 3/4), so exactly 1 succeeds and 2 get room_full!
+    let mut futs = Vec::new();
+    for _ in 0..3 {
+        let u = url.clone();
+        let rid = room_id.clone();
+        let sec = code.access_secret.clone();
+        futs.push(tokio::spawn(async move {
+            let mut ws = connect_ws(&u, "https://geistr.pages.dev").await.unwrap();
+            let prov = random_token_b64url(8).unwrap();
+            let mls = MlsSession::new_guest(&rid, &prov).unwrap();
+            let kp_b64 = STANDARD.encode(mls.generate_key_package().unwrap());
+            let nonce = random_token_b64url(16).unwrap();
+            send_msg(
+                &mut ws,
+                &ClientToRelay::JoinRoomWithCode {
+                    room_id: rid,
+                    access_secret: sec,
+                    key_package_b64: kp_b64,
+                    client_join_nonce: nonce,
+                },
+            )
+            .await;
+            let resp = recv_msg(&mut ws).await;
+            (ws, resp)
+        }));
+    }
+
+    let mut pending_count = 0usize;
+    let mut full_count = 0usize;
+    let mut _kept_sockets = Vec::new();
+    for f in futs {
+        let (ws, resp) = f.await.unwrap();
+        match resp {
+            RelayToClient::JoinPending { .. } => pending_count += 1,
+            RelayToClient::Error { code, .. } if code == "room_full" => full_count += 1,
+            other => panic!("unexpected parallel room-code join response: {other:?}"),
+        }
+        _kept_sockets.push(ws);
+    }
+    assert_eq!(pending_count, 1, "only the 3rd guest slot may be reserved");
+    assert_eq!(full_count, 2, "4th and 5th guests must get room_full");
+
+    // Suppress unused warnings.
+    let _ = (&mut g1_mls, &mut g2_mls);
+}
+
+#[tokio::test]
+async fn room_code_join_while_admin_offline_completes_automatically_after_admin_resume() {
+    let start_ms = 1_700_000_000_000u64;
+    let (url, state, clock) =
+        spawn_test_relay_with_clock(RelayConfig::default(), start_ms, false).await;
+    let (mut admin_ws, room_id, admin_id, admin_resume, mut admin_key, mut admin_mls) =
+        create_initialized_room(&url).await;
+
+    let (code, _exp) = set_room_code(&mut admin_ws, &mut admin_key, &room_id, 0, 900).await;
+    let admin_pk = admin_key.verifying_key_bytes();
+    let admin_fp = admin_key.fingerprint();
+
+    // Admin drops unintentionally (e.g. switched apps on mobile).
+    drop(admin_ws);
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    assert_eq!(state.active_room_count().await, 1);
+
+    // Guest joins via room code while admin is offline.
+    let mut guest_ws = connect_ws(&url, "https://geistr.pages.dev").await.unwrap();
+    let prov = random_token_b64url(8).unwrap();
+    let mut guest_mls = MlsSession::new_guest(&room_id, &prov).unwrap();
+    let kp_b64 = STANDARD.encode(guest_mls.generate_key_package().unwrap());
+    let nonce = random_token_b64url(16).unwrap();
+
+    send_msg(
+        &mut guest_ws,
+        &ClientToRelay::JoinRoomWithCode {
+            room_id: room_id.clone(),
+            access_secret: code.access_secret.clone(),
+            key_package_b64: kp_b64,
+            client_join_nonce: nonce,
+        },
+    )
+    .await;
+    match recv_msg(&mut guest_ws).await {
+        RelayToClient::JoinPending { reason, .. } => {
+            assert!(reason.to_lowercase().contains("offline"));
+        }
+        other => panic!("expected JoinPending while admin offline, got {other:?}"),
+    }
+
+    // Advance clock 20s (within reservation, code, and admin resume deadlines).
+    clock.store(start_ms + 20_000, Ordering::SeqCst);
+    state.sweep_once().await;
+
+    // Admin resumes and automatically receives the queued GuestJoinRequest.
+    let mut admin_ws2 = connect_ws(&url, "https://geistr.pages.dev").await.unwrap();
+    send_msg(
+        &mut admin_ws2,
+        &ClientToRelay::ResumeSession {
+            room_id: room_id.clone(),
+            participant_id: admin_id,
+            resume_token: admin_resume,
+            resume_attempt_id: "admin-resume-code-join".into(),
+            last_epoch: 0,
+        },
+    )
+    .await;
+    match recv_msg(&mut admin_ws2).await {
+        RelayToClient::SessionResumed {
+            epoch,
+            room_code_expires_at_ms,
+            ..
+        } => {
+            assert_eq!(epoch, 0);
+            assert!(room_code_expires_at_ms.is_some());
+        }
+        other => panic!("expected SessionResumed, got {other:?}"),
+    }
+
+    let (res_id, guest_id, guest_kp_b64) = match recv_msg(&mut admin_ws2).await {
+        RelayToClient::GuestJoinRequest {
+            reservation_id,
+            guest_id,
+            key_package_b64,
+        } => (reservation_id, guest_id, key_package_b64),
+        other => panic!("expected GuestJoinRequest after admin resume, got {other:?}"),
+    };
+
+    let staged = admin_mls
+        .stage_add_member(&STANDARD.decode(&guest_kp_b64).unwrap())
+        .unwrap();
+    send_msg(
+        &mut admin_ws2,
+        &ClientToRelay::CompleteJoin {
+            reservation_id: res_id,
+            guest_id,
+            commit_id: "admit-after-resume".into(),
+            expected_epoch: 0,
+            commit_b64: STANDARD.encode(&staged.commit_bytes),
+            welcome_b64: STANDARD.encode(&staged.welcome_bytes),
+            new_epoch: 1,
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv_msg(&mut admin_ws2).await,
+        RelayToClient::CommitAccepted { new_epoch: 1, .. }
+    ));
+    admin_mls.apply_pending_commit().unwrap();
+
+    match recv_msg(&mut guest_ws).await {
+        RelayToClient::JoinAccepted {
+            welcome_b64, epoch, ..
+        } => {
+            assert_eq!(epoch, 1);
+            let joined_ep = guest_mls
+                .join_from_welcome(
+                    &STANDARD.decode(&welcome_b64).unwrap(),
+                    &admin_pk,
+                    &admin_fp,
+                )
+                .unwrap();
+            assert_eq!(joined_ep, 1);
+        }
+        other => panic!("expected JoinAccepted after admin resume, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn room_code_fails_uniformly_after_revoke_rotation_room_end_restart_and_reused_display_name()
+{
+    let cfg = RelayConfig {
+        max_failed_room_code_joins_per_ip_per_min: 50,
+        ..Default::default()
+    };
+    let (url, _state) = spawn_test_relay(cfg.clone()).await;
+
+    // Create room with a display name.
+    let mut admin_ws = connect_ws(&url, "https://geistr.pages.dev").await.unwrap();
+    let mut admin_key = AdminSigningKey::generate("pending").unwrap();
+    let policy = RoomPolicy::default();
+    send_msg(
+        &mut admin_ws,
+        &ClientToRelay::CreateRoom {
+            admin_pubkey_b64: admin_key.verifying_key_b64(),
+            initial_policy: policy,
+            room_name: Some("Alpha Team".into()),
+        },
+    )
+    .await;
+    let (room_id, admin_id) = match recv_msg(&mut admin_ws).await {
+        RelayToClient::RoomCreated {
+            room_id,
+            room_name,
+            participant_id,
+            ..
+        } => {
+            assert_eq!(room_name.as_deref(), Some("Alpha Team"));
+            (room_id, participant_id)
+        }
+        other => panic!("expected RoomCreated, got {other:?}"),
+    };
+    admin_key.rebind_room(&room_id);
+    let init_policy = admin_key
+        .sign_command(
+            0,
+            AdminCommandPayload::SetPolicy {
+                msg_ttl_secs: policy.msg_ttl_secs,
+                room_ttl_secs: policy.room_ttl_secs,
+            },
+        )
+        .unwrap();
+    send_msg(
+        &mut admin_ws,
+        &ClientToRelay::AdminCommand {
+            signed_cmd: init_policy,
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv_msg(&mut admin_ws).await,
+        RelayToClient::PolicyUpdated { .. }
+    ));
+    let mut admin_mls = MlsSession::new_admin(&room_id, &admin_id, &admin_key).unwrap();
+    admin_mls.create_group().unwrap();
+
+    // Helper to assert uniform room-code error.
+    async fn assert_uniform_code_rejection(url: &str, rid: &str, secret: &str) {
+        let mut ws = connect_ws(url, "https://geistr.pages.dev").await.unwrap();
+        send_msg(
+            &mut ws,
+            &ClientToRelay::JoinRoomWithCode {
+                room_id: rid.to_string(),
+                access_secret: secret.to_string(),
+                key_package_b64: "ZHVtbXk=".into(),
+                client_join_nonce: "nonce12345678".into(),
+            },
+        )
+        .await;
+        match recv_msg(&mut ws).await {
+            RelayToClient::Error { code, message } => {
+                assert_eq!(code, ROOM_CODE_ERROR_CODE);
+                assert_eq!(message, ROOM_CODE_ERROR_MSG);
+            }
+            other => panic!("expected uniform invalid_room_code error, got {other:?}"),
+        }
+    }
+
+    // 1. Unknown room & wrong secret give the exact same uniform error.
+    assert_uniform_code_rejection(
+        &url,
+        "nonexistent-room-id-1234",
+        "secret-does-not-exist-1234",
+    )
+    .await;
+
+    let (code1, _exp1) = set_room_code(&mut admin_ws, &mut admin_key, &room_id, 0, 900).await;
+    assert_uniform_code_rejection(&url, &room_id, "wrong-secret-value-12345678").await;
+
+    // 2. Admit Guest 1 with code1; then open a pending reservation for Guest 2 with code1.
+    let (mut g1_ws, _g1_id, _g1_res, mut g1_mls) = admit_guest_with_code(
+        &url,
+        &code1.encode(),
+        &mut admin_ws,
+        &mut admin_mls,
+        &mut [],
+        0,
+    )
+    .await;
+
+    let mut pending_ws = connect_ws(&url, "https://geistr.pages.dev").await.unwrap();
+    send_msg(
+        &mut pending_ws,
+        &ClientToRelay::JoinRoomWithCode {
+            room_id: room_id.clone(),
+            access_secret: code1.access_secret.clone(),
+            key_package_b64: "ZHVtbXk=".into(),
+            client_join_nonce: "pending-nonce-1234".into(),
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv_msg(&mut pending_ws).await,
+        RelayToClient::JoinPending { .. }
+    ));
+    assert!(matches!(
+        recv_msg(&mut admin_ws).await,
+        RelayToClient::GuestJoinRequest { .. }
+    ));
+
+    // 3. Rotate to code2 -> pending reservation of code1 is immediately invalidated!
+    let (code2, _exp2) = set_room_code(&mut admin_ws, &mut admin_key, &room_id, 1, 900).await;
+    match recv_msg(&mut pending_ws).await {
+        RelayToClient::Error { code, message } => {
+            assert_eq!(code, ROOM_CODE_ERROR_CODE);
+            assert_eq!(message, ROOM_CODE_ERROR_MSG);
+        }
+        other => panic!("expected old pending reservation to be invalidated, got {other:?}"),
+    }
+    // Old code1 now fails uniformly, while already-admitted Guest 1 stays in room!
+    assert_uniform_code_rejection(&url, &room_id, &code1.access_secret).await;
+
+    let msg = ChatAppPayload {
+        message_id: "still-in-room".into(),
+        text: "hello after rotation".into(),
+        sent_at_ms: now_ms(),
+    };
+    let ct = admin_mls.encrypt_chat_message(&msg).unwrap();
+    send_msg(
+        &mut admin_ws,
+        &ClientToRelay::SendMlsMessage {
+            epoch: 1,
+            message_id: msg.message_id.clone(),
+            ciphertext_b64: STANDARD.encode(&ct),
+        },
+    )
+    .await;
+    match recv_msg(&mut g1_ws).await {
+        RelayToClient::MlsMessage { ciphertext_b64, .. } => {
+            let ev = g1_mls
+                .process_incoming(&STANDARD.decode(&ciphertext_b64).unwrap())
+                .unwrap();
+            assert!(matches!(ev, MlsIncomingEvent::ChatMessage { .. }));
+        }
+        other => panic!("already-admitted guest must stay in room, got {other:?}"),
+    }
+
+    // 4. Revoke code2 -> code2 fails uniformly.
+    let revoke_cmd = admin_key
+        .sign_command(1, AdminCommandPayload::RevokeRoomCode)
+        .unwrap();
+    send_msg(
+        &mut admin_ws,
+        &ClientToRelay::AdminCommand {
+            signed_cmd: revoke_cmd,
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv_msg(&mut admin_ws).await,
+        RelayToClient::RoomCodeRevoked
+    ));
+    assert_uniform_code_rejection(&url, &room_id, &code2.access_secret).await;
+
+    // 5. Set code3, then close room -> code3 fails uniformly after room end.
+    let (code3, _exp3) = set_room_code(&mut admin_ws, &mut admin_key, &room_id, 1, 900).await;
+    let close_cmd = admin_key
+        .sign_command(1, AdminCommandPayload::CloseRoom)
+        .unwrap();
+    send_msg(
+        &mut admin_ws,
+        &ClientToRelay::AdminCommand {
+            signed_cmd: close_cmd,
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv_msg(&mut admin_ws).await,
+        RelayToClient::RoomClosed { .. }
+    ));
+    assert_uniform_code_rejection(&url, &room_id, &code3.access_secret).await;
+
+    // 6. Create a new room with the EXACT SAME display name "Alpha Team" -> old code3 STILL fails!
+    let mut admin2_ws = connect_ws(&url, "https://geistr.pages.dev").await.unwrap();
+    let admin2_key = AdminSigningKey::generate("pending").unwrap();
+    send_msg(
+        &mut admin2_ws,
+        &ClientToRelay::CreateRoom {
+            admin_pubkey_b64: admin2_key.verifying_key_b64(),
+            initial_policy: RoomPolicy::default(),
+            room_name: Some("Alpha Team".into()),
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv_msg(&mut admin2_ws).await,
+        RelayToClient::RoomCreated { .. }
+    ));
+    assert_uniform_code_rejection(&url, &room_id, &code3.access_secret).await;
+
+    // 7. Simulated relay restart (fresh RelayState in RAM) -> old code fails uniformly.
+    let (restarted_url, _restarted_state) = spawn_test_relay(cfg).await;
+    assert_uniform_code_rejection(&restarted_url, &room_id, &code3.access_secret).await;
+}
+
+#[tokio::test]
+async fn room_code_failed_attempts_are_rate_limited_server_side() {
+    let cfg = RelayConfig {
+        max_failed_room_code_joins_per_ip_per_min: 3,
+        ..Default::default()
+    };
+    let (url, _state) = spawn_test_relay(cfg).await;
+
+    for _ in 0..3 {
+        let mut ws = connect_ws(&url, "https://geistr.pages.dev").await.unwrap();
+        send_msg(
+            &mut ws,
+            &ClientToRelay::JoinRoomWithCode {
+                room_id: "missing-room-12345678".into(),
+                access_secret: "bad-secret-1234567890".into(),
+                key_package_b64: "ZHVtbXk=".into(),
+                client_join_nonce: "nonce12345678".into(),
+            },
+        )
+        .await;
+        match recv_msg(&mut ws).await {
+            RelayToClient::Error { code, .. } => assert_eq!(code, ROOM_CODE_ERROR_CODE),
+            other => panic!("expected invalid_room_code, got {other:?}"),
+        }
+    }
+
+    // 4th attempt within the 60s window must be rate-limited!
+    let mut ws = connect_ws(&url, "https://geistr.pages.dev").await.unwrap();
+    send_msg(
+        &mut ws,
+        &ClientToRelay::JoinRoomWithCode {
+            room_id: "missing-room-12345678".into(),
+            access_secret: "bad-secret-1234567890".into(),
+            key_package_b64: "ZHVtbXk=".into(),
+            client_join_nonce: "nonce12345678".into(),
+        },
+    )
+    .await;
+    match recv_msg(&mut ws).await {
+        RelayToClient::Error { code, .. } => assert_eq!(code, "rate_limited"),
+        other => panic!("expected rate_limited on 4th failed room-code attempt, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn room_code_tampered_admin_fingerprint_blocks_mls_join() {
+    let (url, _state) = spawn_test_relay(RelayConfig::default()).await;
+    let (mut admin_ws, room_id, _admin_id, _admin_resume, mut admin_key, mut admin_mls) =
+        create_initialized_room(&url).await;
+
+    let (code, _exp) = set_room_code(&mut admin_ws, &mut admin_key, &room_id, 0, 900).await;
+
+    // Construct a room code with a tampered admin fingerprint (from a different key).
+    let attacker_key = AdminSigningKey::generate(&room_id).unwrap();
+    let tampered_code = RoomCode::new(&room_id, &code.access_secret, attacker_key.fingerprint())
+        .unwrap()
+        .encode();
+    let parsed = RoomCode::parse(&tampered_code).unwrap();
+
+    let mut guest_ws = connect_ws(&url, "https://geistr.pages.dev").await.unwrap();
+    let prov = random_token_b64url(8).unwrap();
+    let mut guest_mls = MlsSession::new_guest(&parsed.room_id, &prov).unwrap();
+    let kp_b64 = STANDARD.encode(guest_mls.generate_key_package().unwrap());
+    let nonce = random_token_b64url(16).unwrap();
+
+    send_msg(
+        &mut guest_ws,
+        &ClientToRelay::JoinRoomWithCode {
+            room_id: parsed.room_id.clone(),
+            access_secret: parsed.access_secret.clone(),
+            key_package_b64: kp_b64,
+            client_join_nonce: nonce,
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv_msg(&mut guest_ws).await,
+        RelayToClient::JoinPending { .. }
+    ));
+
+    let (res_id, guest_id, guest_kp_b64) = match recv_msg(&mut admin_ws).await {
+        RelayToClient::GuestJoinRequest {
+            reservation_id,
+            guest_id,
+            key_package_b64,
+        } => (reservation_id, guest_id, key_package_b64),
+        other => panic!("expected GuestJoinRequest, got {other:?}"),
+    };
+    let staged = admin_mls
+        .stage_add_member(&STANDARD.decode(&guest_kp_b64).unwrap())
+        .unwrap();
+    send_msg(
+        &mut admin_ws,
+        &ClientToRelay::CompleteJoin {
+            reservation_id: res_id,
+            guest_id,
+            commit_id: "tampered-fp-commit".into(),
+            expected_epoch: 0,
+            commit_b64: STANDARD.encode(&staged.commit_bytes),
+            welcome_b64: STANDARD.encode(&staged.welcome_bytes),
+            new_epoch: 1,
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv_msg(&mut admin_ws).await,
+        RelayToClient::CommitAccepted { new_epoch: 1, .. }
+    ));
+
+    match recv_msg(&mut guest_ws).await {
+        RelayToClient::JoinAccepted {
+            welcome_b64,
+            admin_pubkey_b64,
+            ..
+        } => {
+            let admin_pk = core_crypto::admin::decode_pubkey_b64(&admin_pubkey_b64).unwrap();
+            assert_ne!(
+                compute_admin_fingerprint(&admin_pk, &parsed.room_id),
+                parsed.admin_fingerprint
+            );
+            assert!(
+                guest_mls
+                    .join_from_welcome(
+                        &STANDARD.decode(&welcome_b64).unwrap(),
+                        &admin_pk,
+                        &parsed.admin_fingerprint,
+                    )
+                    .is_err(),
+                "MLS join must fail when admin fingerprint does not match"
+            );
+        }
+        other => panic!("expected JoinAccepted, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn room_code_resume_reconciles_lost_confirmation_for_initial_create_and_rotation() {
+    use std::collections::HashMap;
+
+    let (url, _state) = spawn_test_relay(RelayConfig::default()).await;
+    let (mut admin_ws, room_id, admin_id, admin_resume, mut admin_key, mut admin_mls) =
+        create_initialized_room(&url).await;
+
+    // Track local worker state: confirmed active_room_code + pending_room_codes.
+    let mut active_room_code: Option<(RoomCode, u64)> = None;
+    let mut pending_room_codes: HashMap<String, RoomCode> = HashMap::new();
+
+    // 1. Initial creation: Admin sends SetRoomCode(code1) and disconnects BEFORE reading RoomCodeUpdated.
+    let code1 = RoomCode::new(
+        &room_id,
+        random_token_b64url(24).unwrap(),
+        admin_key.fingerprint(),
+    )
+    .unwrap();
+    pending_room_codes.insert(code1.secret_hash_hex(), code1.clone());
+    let cmd1 = admin_key
+        .sign_command(
+            0,
+            AdminCommandPayload::SetRoomCode {
+                secret_hash_hex: code1.secret_hash_hex(),
+                code_ttl_secs: 900,
+            },
+        )
+        .unwrap();
+    send_msg(
+        &mut admin_ws,
+        &ClientToRelay::AdminCommand { signed_cmd: cmd1 },
+    )
+    .await;
+    // Allow relay to process SetRoomCode, then drop socket without consuming RoomCodeUpdated.
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    drop(admin_ws);
+    tokio::time::sleep(Duration::from_millis(60)).await;
+
+    // Admin resumes and reconciles using SessionResumed's room_code_secret_hash_hex.
+    let mut admin_ws2 = connect_ws(&url, "https://geistr.pages.dev").await.unwrap();
+    send_msg(
+        &mut admin_ws2,
+        &ClientToRelay::ResumeSession {
+            room_id: room_id.clone(),
+            participant_id: admin_id.clone(),
+            resume_token: admin_resume,
+            resume_attempt_id: "resume-after-initial-code".into(),
+            last_epoch: 0,
+        },
+    )
+    .await;
+    let admin_resume2 = match recv_msg(&mut admin_ws2).await {
+        RelayToClient::SessionResumed {
+            resume_token,
+            room_expires_at_ms,
+            room_code_secret_hash_hex,
+            room_code_expires_at_ms,
+            ..
+        } => {
+            assert_eq!(
+                room_code_secret_hash_hex.as_deref(),
+                Some(code1.secret_hash_hex().as_str())
+            );
+            reconcile_room_code_on_resume(
+                &mut active_room_code,
+                &mut pending_room_codes,
+                room_code_secret_hash_hex.as_deref(),
+                room_code_expires_at_ms,
+                room_expires_at_ms,
+                now_ms(),
+            );
+            resume_token
+        }
+        other => panic!("expected SessionResumed after initial code, got {other:?}"),
+    };
+    send_msg(&mut admin_ws2, &ClientToRelay::AckResume).await;
+
+    assert!(pending_room_codes.is_empty());
+    assert_eq!(
+        active_room_code.as_ref().map(|(c, _)| c.encode()),
+        Some(code1.encode()),
+        "UI must expose the confirmed initial room code after resume"
+    );
+
+    // Guest 1 successfully joins using the reconciled code1.
+    let (mut g1_ws, _g1_id, _g1_res, mut g1_mls) = admit_guest_with_code(
+        &url,
+        &active_room_code.as_ref().unwrap().0.encode(),
+        &mut admin_ws2,
+        &mut admin_mls,
+        &mut [],
+        0,
+    )
+    .await;
+
+    // 2. Rotation: Admin sends SetRoomCode(code2) and disconnects BEFORE reading RoomCodeUpdated.
+    let code2 = RoomCode::new(
+        &room_id,
+        random_token_b64url(24).unwrap(),
+        admin_key.fingerprint(),
+    )
+    .unwrap();
+    pending_room_codes.insert(code2.secret_hash_hex(), code2.clone());
+    let cmd2 = admin_key
+        .sign_command(
+            1,
+            AdminCommandPayload::SetRoomCode {
+                secret_hash_hex: code2.secret_hash_hex(),
+                code_ttl_secs: 900,
+            },
+        )
+        .unwrap();
+    send_msg(
+        &mut admin_ws2,
+        &ClientToRelay::AdminCommand { signed_cmd: cmd2 },
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    drop(admin_ws2);
+    tokio::time::sleep(Duration::from_millis(60)).await;
+
+    // Drain Guest 1's MemberStatus(admin disconnected).
+    let _ = recv_msg(&mut g1_ws).await;
+
+    // Admin resumes again and reconciles: code2 must replace code1!
+    let mut admin_ws3 = connect_ws(&url, "https://geistr.pages.dev").await.unwrap();
+    send_msg(
+        &mut admin_ws3,
+        &ClientToRelay::ResumeSession {
+            room_id: room_id.clone(),
+            participant_id: admin_id,
+            resume_token: admin_resume2,
+            resume_attempt_id: "resume-after-rotated-code".into(),
+            last_epoch: 1,
+        },
+    )
+    .await;
+    match recv_msg(&mut admin_ws3).await {
+        RelayToClient::SessionResumed {
+            room_expires_at_ms,
+            room_code_secret_hash_hex,
+            room_code_expires_at_ms,
+            ..
+        } => {
+            assert_eq!(
+                room_code_secret_hash_hex.as_deref(),
+                Some(code2.secret_hash_hex().as_str())
+            );
+            reconcile_room_code_on_resume(
+                &mut active_room_code,
+                &mut pending_room_codes,
+                room_code_secret_hash_hex.as_deref(),
+                room_code_expires_at_ms,
+                room_expires_at_ms,
+                now_ms(),
+            );
+        }
+        other => panic!("expected SessionResumed after rotation, got {other:?}"),
+    }
+    // Drain Guest 1's MemberStatus(admin reconnected).
+    let _ = recv_msg(&mut g1_ws).await;
+
+    assert!(pending_room_codes.is_empty());
+    assert_eq!(
+        active_room_code.as_ref().map(|(c, _)| c.encode()),
+        Some(code2.encode()),
+        "UI must expose ONLY the new rotated code after resume, never old code1"
+    );
+
+    // Old code1 must be rejected by relay; reconciled code2 admits Guest 2!
+    let mut old_ws = connect_ws(&url, "https://geistr.pages.dev").await.unwrap();
+    send_msg(
+        &mut old_ws,
+        &ClientToRelay::JoinRoomWithCode {
+            room_id: room_id.clone(),
+            access_secret: code1.access_secret.clone(),
+            key_package_b64: "ZHVtbXk=".into(),
+            client_join_nonce: "old-code-nonce-1234".into(),
+        },
+    )
+    .await;
+    match recv_msg(&mut old_ws).await {
+        RelayToClient::Error { code, message } => {
+            assert_eq!(code, ROOM_CODE_ERROR_CODE);
+            assert_eq!(message, ROOM_CODE_ERROR_MSG);
+        }
+        other => panic!("expected old code1 to fail after rotation, got {other:?}"),
+    }
+
+    let (_g2_ws, _g2_id, _g2_res, _g2_mls) = admit_guest_with_code(
+        &url,
+        &active_room_code.as_ref().unwrap().0.encode(),
+        &mut admin_ws3,
+        &mut admin_mls,
+        &mut [(&mut g1_ws, &mut g1_mls)],
+        1,
+    )
+    .await;
 }

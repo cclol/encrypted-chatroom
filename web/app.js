@@ -27,16 +27,24 @@ const els = {
   endedTitle: document.getElementById("ended-title"),
   endedReason: document.getElementById("ended-reason"),
   errorToast: document.getElementById("error-toast"),
+  createRoomName: document.getElementById("create-room-name"),
   createMsgTtl: document.getElementById("create-msg-ttl"),
   createRoomTtl: document.getElementById("create-room-ttl"),
   relayUrlInput: document.getElementById("relay-url-input"),
   btnCreateRoom: document.getElementById("btn-create-room"),
+  joinCodeForm: document.getElementById("join-code-form"),
+  joinRoomCodeInput: document.getElementById("join-room-code-input"),
+  btnJoinRoomCode: document.getElementById("btn-join-room-code"),
   btnMlsSelftest: document.getElementById("btn-mls-selftest"),
   selftestOutput: document.getElementById("selftest-output"),
   btnCancelJoin: document.getElementById("btn-cancel-join"),
   btnRoomDrawer: document.getElementById("btn-room-drawer"),
   roomDrawer: document.getElementById("room-drawer"),
   chatStatusDot: document.getElementById("chat-status-dot"),
+  metaRoomNameHeader: document.getElementById("meta-room-name-header"),
+  metaRoomNameSep: document.getElementById("meta-room-name-sep"),
+  drawerRoomNameRow: document.getElementById("drawer-room-name-row"),
+  metaRoomName: document.getElementById("meta-room-name"),
   metaRoomId: document.getElementById("meta-room-id"),
   metaEpoch: document.getElementById("meta-epoch"),
   metaRoomCountdown: document.getElementById("meta-room-countdown"),
@@ -46,6 +54,14 @@ const els = {
   memberList: document.getElementById("member-list"),
   adminControls: document.getElementById("admin-controls"),
   adminWipeBar: document.getElementById("admin-wipe-bar"),
+  roomCodeGenerateWrap: document.getElementById("room-code-generate-wrap"),
+  btnGenerateRoomCode: document.getElementById("btn-generate-room-code"),
+  roomCodeOutputBox: document.getElementById("room-code-output-box"),
+  roomCodeOutput: document.getElementById("room-code-output"),
+  btnCopyRoomCode: document.getElementById("btn-copy-room-code"),
+  btnRotateRoomCode: document.getElementById("btn-rotate-room-code"),
+  btnRevokeRoomCode: document.getElementById("btn-revoke-room-code"),
+  roomCodeValidityHint: document.getElementById("room-code-validity-hint"),
   btnGenerateInvite: document.getElementById("btn-generate-invite"),
   btnQuickInvite: document.getElementById("btn-quick-invite"),
   btnPanicWipe: document.getElementById("btn-panic-wipe"),
@@ -163,6 +179,8 @@ let unreadWhileScrolledUp = 0;
 let baseViewportHeight = window.innerHeight || 0;
 let currentInviteExpiresAtMs = 0;
 let inviteCopiedUntilMs = 0;
+let currentRoomCodeExpiresAtMs = 0;
+let roomCodeCopiedUntilMs = 0;
 
 function clearPendingInviteMemory() {
   if (!pendingInvite) return;
@@ -215,6 +233,29 @@ function updateInviteValidityHint() {
   }
 }
 
+function updateRoomCodeValidityHint() {
+  if (!els.roomCodeValidityHint) return;
+  if (!currentRoomCodeExpiresAtMs || els.roomCodeOutputBox.classList.contains("hidden")) {
+    els.roomCodeValidityHint.textContent = "";
+    els.roomCodeValidityHint.className = "invite-validity-hint small muted";
+    return;
+  }
+  const now = Date.now();
+  if (now >= currentRoomCodeExpiresAtMs) {
+    els.roomCodeValidityHint.textContent = "Room code expired — generate a new code.";
+    els.roomCodeValidityHint.className = "invite-validity-hint small is-expired";
+    return;
+  }
+  const remaining = formatCountdown(currentRoomCodeExpiresAtMs);
+  if (now < roomCodeCopiedUntilMs) {
+    els.roomCodeValidityHint.textContent = `Copied — room code valid for ${remaining}.`;
+    els.roomCodeValidityHint.className = "invite-validity-hint small is-copied";
+  } else {
+    els.roomCodeValidityHint.textContent = `Room code valid for ${remaining}.`;
+    els.roomCodeValidityHint.className = "invite-validity-hint small muted";
+  }
+}
+
 function clearVisibleMessagesDom() {
   while (els.messageList.firstChild) {
     els.messageList.removeChild(els.messageList.firstChild);
@@ -224,6 +265,21 @@ function clearVisibleMessagesDom() {
   currentInviteExpiresAtMs = 0;
   inviteCopiedUntilMs = 0;
   updateInviteValidityHint();
+  if (els.roomCodeOutput) {
+    els.roomCodeOutput.value = "";
+  }
+  if (els.roomCodeOutputBox) {
+    els.roomCodeOutputBox.classList.add("hidden");
+  }
+  if (els.roomCodeGenerateWrap) {
+    els.roomCodeGenerateWrap.classList.remove("hidden");
+  }
+  currentRoomCodeExpiresAtMs = 0;
+  roomCodeCopiedUntilMs = 0;
+  updateRoomCodeValidityHint();
+  if (els.joinRoomCodeInput) {
+    els.joinRoomCodeInput.value = "";
+  }
   unreadWhileScrolledUp = 0;
   els.btnNewMessages.classList.add("hidden");
   setDrawerOpen(false);
@@ -250,6 +306,7 @@ function tickCountdowns() {
     els.metaRoomCountdown.textContent = formatCountdown(currentState.roomExpiresAtMs);
   }
   updateInviteValidityHint();
+  updateRoomCodeValidityHint();
   for (const node of els.messageList.querySelectorAll(".msg-exp")) {
     const ts = Number(node.dataset.expiresAt || "0");
     if (ts > 0) {
@@ -653,7 +710,7 @@ if (!runtimeSupport.ok) {
   }
 
   try {
-    worker = new Worker("./worker.js", { type: "module" });
+    worker = new Worker("./worker.js?v=room-code-1", { type: "module" });
   } catch (err) {
     showUnsupportedBrowser(err instanceof Error ? err.message : String(err));
   }
@@ -764,6 +821,25 @@ if (worker) {
         break;
       }
 
+      case "room_code_state": {
+        if (msg.active && msg.room_code) {
+          els.roomCodeOutput.value = msg.room_code;
+          currentRoomCodeExpiresAtMs = msg.expires_at_ms || 0;
+          roomCodeCopiedUntilMs = 0;
+          els.roomCodeOutputBox.classList.remove("hidden");
+          els.roomCodeGenerateWrap.classList.add("hidden");
+          updateRoomCodeValidityHint();
+        } else {
+          els.roomCodeOutput.value = "";
+          currentRoomCodeExpiresAtMs = 0;
+          roomCodeCopiedUntilMs = 0;
+          els.roomCodeOutputBox.classList.add("hidden");
+          els.roomCodeGenerateWrap.classList.remove("hidden");
+          updateRoomCodeValidityHint();
+        }
+        break;
+      }
+
       case "state_update": {
         const members = msg.members || [];
         currentState = {
@@ -800,6 +876,16 @@ if (worker) {
             currentInviteExpiresAtMs = Math.min(currentInviteExpiresAtMs, msg.room_expires_at_ms);
             updateInviteValidityHint();
           }
+          if (currentRoomCodeExpiresAtMs > 0 && msg.room_expires_at_ms > 0) {
+            currentRoomCodeExpiresAtMs = Math.min(currentRoomCodeExpiresAtMs, msg.room_expires_at_ms);
+            updateRoomCodeValidityHint();
+          }
+          const roomName = msg.room_name || "";
+          els.metaRoomNameHeader.textContent = roomName;
+          els.metaRoomNameHeader.classList.toggle("hidden", !roomName);
+          els.metaRoomNameSep.classList.toggle("hidden", !roomName);
+          els.metaRoomName.textContent = roomName;
+          els.drawerRoomNameRow.classList.toggle("hidden", !roomName);
           const ttlLabel = formatTtl(msg.policy.msg_ttl_secs);
           els.metaRoomId.textContent = msg.room_id || "";
           els.metaEpoch.textContent = String(msg.epoch ?? 0);
@@ -989,12 +1075,65 @@ els.btnRoomDrawer.addEventListener("click", () => {
 });
 
 els.btnCreateRoom.addEventListener("click", () => {
+  const roomName = els.createRoomName ? els.createRoomName.value.trim() : "";
+  if (els.createRoomName) {
+    els.createRoomName.value = "";
+  }
   sendWorker({
     type: "create_room",
     relay_url: els.relayUrlInput.value.trim(),
     msg_ttl_secs: Number(els.createMsgTtl.value),
     room_ttl_secs: Number(els.createRoomTtl.value),
+    room_name: roomName || null,
   });
+});
+
+els.joinCodeForm.addEventListener("submit", (ev) => {
+  ev.preventDefault();
+  const roomCode = els.joinRoomCodeInput.value.trim();
+  els.joinRoomCodeInput.value = "";
+  if (!roomCode) {
+    showError("Please paste a room code first.");
+    return;
+  }
+  sendWorker({
+    type: "join_with_room_code",
+    relay_url: els.relayUrlInput.value.trim(),
+    room_code: roomCode,
+  });
+});
+
+els.btnGenerateRoomCode.addEventListener("click", () => {
+  sendWorker({ type: "generate_room_code" });
+});
+
+els.btnRotateRoomCode.addEventListener("click", () => {
+  sendWorker({ type: "generate_room_code" });
+});
+
+els.btnRevokeRoomCode.addEventListener("click", () => {
+  sendWorker({ type: "revoke_room_code" });
+});
+
+els.btnCopyRoomCode.addEventListener("click", async () => {
+  if (!els.roomCodeOutput.value) return;
+  try {
+    await navigator.clipboard.writeText(els.roomCodeOutput.value);
+    const remaining =
+      currentRoomCodeExpiresAtMs > Date.now()
+        ? formatCountdown(currentRoomCodeExpiresAtMs)
+        : null;
+    els.btnCopyRoomCode.textContent = remaining ? `Copied (${remaining})` : "Copied";
+    roomCodeCopiedUntilMs = Date.now() + 8000;
+    updateRoomCodeValidityHint();
+    window.setTimeout(() => {
+      els.btnCopyRoomCode.textContent = "Copy room code";
+    }, 2500);
+  } catch {
+    els.roomCodeOutput.select();
+    roomCodeCopiedUntilMs = Date.now() + 8000;
+    updateRoomCodeValidityHint();
+  }
 });
 
 els.btnMlsSelftest.addEventListener("click", () => {

@@ -11,6 +11,7 @@ use core_crypto::policy::{MAX_ROOM_MEMBERS, RoomPolicy};
 use core_crypto::protocol::{
     ClientToRelay, MemberSummary, MissedCommit, ParticipantRole, RelayToClient,
 };
+use core_crypto::room_code::sanitize_room_name;
 use core_crypto::{random_token_b64url, sha256_hex};
 use subtle::ConstantTimeEq;
 use tokio::sync::{Mutex, mpsc, watch};
@@ -24,6 +25,10 @@ const WELCOME_CACHE_WINDOW_MS: u64 = 30_000;
 const MAX_ROOM_CREATIONS_PER_IP_PER_MIN: usize = 10;
 const CHAT_MESSAGE_REFILL_MS: u64 = 1_500; // 40 messages per minute
 const CHAT_MESSAGE_BURST: u64 = 10;
+
+/// Uniform public error returned for invalid, revoked, or expired room codes and non-existent/ended rooms.
+pub const ROOM_CODE_ERROR_CODE: &str = "invalid_room_code";
+pub const ROOM_CODE_ERROR_MSG: &str = "Room code is invalid, revoked, or the room has ended";
 
 pub fn now_ms() -> u64 {
     SystemTime::now()
@@ -120,6 +125,7 @@ pub struct ConnBinding {
     pub role: ParticipantRole,
     pub is_pending_reservation: bool,
     pub reservation_token_hash: Option<String>,
+    pub reservation_room_code_id: Option<String>,
 }
 
 enum MemberConn {
@@ -219,8 +225,29 @@ struct InviteEntry {
     state: InviteState,
 }
 
+struct RoomCodeReservation {
+    reservation_id: String,
+    guest_id: String,
+    client_join_nonce: String,
+    key_package_b64: String,
+    guest_conn_id: Option<u64>,
+    guest_handle: Option<OutboundHandle>,
+    expires_at_ms: u64,
+    forwarded_to_admin: bool,
+}
+
+struct ActiveRoomCode {
+    secret_hash_hex: String,
+    expires_at_ms: u64,
+    /// Open reservations created via this room code, keyed by `reservation_id`.
+    reservations: HashMap<String, RoomCodeReservation>,
+    /// Short-lived welcome cache for idempotent retry, keyed by `client_join_nonce`.
+    cached_welcomes: HashMap<String, CachedJoinAccepted>,
+}
+
 struct Room {
     room_id: String,
+    room_name: Option<String>,
     admin_id: String,
     admin_pubkey_b64: String,
     admin_verifier: AdminCommandVerifier,
@@ -235,6 +262,7 @@ struct Room {
     commit_log: VecDeque<MissedCommit>,
     members: HashMap<String, MemberEntry>,
     invites: HashMap<String, InviteEntry>,
+    active_room_code: Option<ActiveRoomCode>,
     pending_removals: HashSet<String>,
 }
 
@@ -324,10 +352,32 @@ impl Room {
     }
 
     fn reserved_slot_count(&self) -> usize {
-        self.invites
+        let invite_reserved = self
+            .invites
             .values()
             .filter(|inv| matches!(inv.state, InviteState::Reserved { .. }))
-            .count()
+            .count();
+        let code_reserved = self
+            .active_room_code
+            .as_ref()
+            .map_or(0, |rc| rc.reservations.len());
+        invite_reserved + code_reserved
+    }
+
+    /// Invalidates the active room code (if any) and closes all open pending reservations
+    /// associated with it using the uniform public room-code error. Already-admitted guests remain.
+    fn invalidate_active_room_code(&mut self) {
+        if let Some(rc) = self.active_room_code.take() {
+            for res in rc.reservations.into_values() {
+                if let Some(gh) = res.guest_handle {
+                    gh.try_send_msg(&RelayToClient::Error {
+                        code: ROOM_CODE_ERROR_CODE.into(),
+                        message: ROOM_CODE_ERROR_MSG.into(),
+                    });
+                    gh.close();
+                }
+            }
+        }
     }
 
     fn total_occupied_slots(&self) -> usize {
@@ -365,7 +415,7 @@ impl Room {
 
     fn connected_socket_count(&self) -> usize {
         let member_connected = self.connected_member_count();
-        let guest_waiting = self
+        let invite_waiting = self
             .invites
             .values()
             .filter(|inv| {
@@ -378,7 +428,13 @@ impl Room {
                 )
             })
             .count();
-        member_connected + guest_waiting
+        let code_waiting = self.active_room_code.as_ref().map_or(0, |rc| {
+            rc.reservations
+                .values()
+                .filter(|r| r.guest_handle.is_some())
+                .count()
+        });
+        member_connected + invite_waiting + code_waiting
     }
 
     fn all_connected_handles(&self) -> Vec<OutboundHandle> {
@@ -395,6 +451,13 @@ impl Room {
             } = &inv.state
             {
                 handles.push(h.clone());
+            }
+        }
+        if let Some(rc) = &self.active_room_code {
+            for res in rc.reservations.values() {
+                if let Some(h) = &res.guest_handle {
+                    handles.push(h.clone());
+                }
             }
         }
         handles
@@ -426,6 +489,7 @@ struct IpLimiter {
     active_conns: HashMap<IpAddr, usize>,
     recent_attempts: HashMap<IpAddr, VecDeque<u64>>,
     recent_room_creations: HashMap<IpAddr, VecDeque<u64>>,
+    recent_failed_room_code_joins: HashMap<IpAddr, VecDeque<u64>>,
 }
 
 impl IpLimiter {
@@ -435,6 +499,7 @@ impl IpLimiter {
             active_conns: HashMap::new(),
             recent_attempts: HashMap::new(),
             recent_room_creations: HashMap::new(),
+            recent_failed_room_code_joins: HashMap::new(),
         }
     }
 
@@ -449,6 +514,75 @@ impl IpLimiter {
             }
             !attempts.is_empty()
         });
+        self.recent_room_creations.retain(|_, times| {
+            while let Some(&ts) = times.front() {
+                if now.saturating_sub(ts) >= 60_000 {
+                    times.pop_front();
+                } else {
+                    break;
+                }
+            }
+            !times.is_empty()
+        });
+        self.recent_failed_room_code_joins.retain(|_, times| {
+            while let Some(&ts) = times.front() {
+                if now.saturating_sub(ts) >= 60_000 {
+                    times.pop_front();
+                } else {
+                    break;
+                }
+            }
+            !times.is_empty()
+        });
+    }
+
+    fn is_room_code_join_rate_limited(&mut self, ip: IpAddr, now: u64, limit: usize) -> bool {
+        let Some(times) = self.recent_failed_room_code_joins.get_mut(&ip) else {
+            return false;
+        };
+        while times
+            .front()
+            .is_some_and(|&ts| now.saturating_sub(ts) >= 60_000)
+        {
+            times.pop_front();
+        }
+        if times.is_empty() {
+            self.recent_failed_room_code_joins.remove(&ip);
+            return false;
+        }
+        times.len() >= limit
+    }
+
+    fn record_failed_room_code_join(&mut self, ip: IpAddr, now: u64, max_tracked_ips: usize) {
+        if !self.recent_failed_room_code_joins.contains_key(&ip)
+            && self.recent_failed_room_code_joins.len() >= max_tracked_ips
+        {
+            self.recent_failed_room_code_joins.retain(|_, times| {
+                times
+                    .back()
+                    .is_some_and(|&ts| now.saturating_sub(ts) < 60_000)
+            });
+            if self.recent_failed_room_code_joins.len() >= max_tracked_ips {
+                let victim = self
+                    .recent_failed_room_code_joins
+                    .iter()
+                    .min_by_key(|(_, q)| q.back().copied().unwrap_or(0))
+                    .map(|(k, _)| *k);
+                if let Some(v) = victim {
+                    self.recent_failed_room_code_joins.remove(&v);
+                } else {
+                    return;
+                }
+            }
+        }
+        let times = self.recent_failed_room_code_joins.entry(ip).or_default();
+        while times
+            .front()
+            .is_some_and(|&ts| now.saturating_sub(ts) >= 60_000)
+        {
+            times.pop_front();
+        }
+        times.push_back(now);
     }
 
     fn try_record_room_creation(&mut self, ip: IpAddr, now: u64, max_tracked_ips: usize) -> bool {
@@ -692,6 +826,31 @@ impl RelayState {
                 room.invites.remove(&key);
             }
 
+            // Expire active room code, its timed-out reservations, and its cached welcomes.
+            let room_code_expired = room
+                .active_room_code
+                .as_ref()
+                .is_some_and(|rc| now >= rc.expires_at_ms);
+            if room_code_expired {
+                room.invalidate_active_room_code();
+            } else if let Some(rc) = room.active_room_code.as_mut() {
+                rc.reservations.retain(|_, res| {
+                    if now >= res.expires_at_ms {
+                        if let Some(gh) = &res.guest_handle {
+                            gh.try_send_msg(&RelayToClient::Error {
+                                code: "join_timeout".into(),
+                                message: "Join reservation expired before admin responded. You can try again while the room code is still valid.".into(),
+                            });
+                            gh.close();
+                        }
+                        false
+                    } else {
+                        true
+                    }
+                });
+                rc.cached_welcomes.retain(|_, cw| now < cw.expires_at_ms);
+            }
+
             for member in room.members.values_mut() {
                 if let Some(pr) = &member.pending_resume
                     && now >= pr.expires_at_ms
@@ -768,6 +927,7 @@ impl RelayState {
             ClientToRelay::CreateRoom {
                 admin_pubkey_b64,
                 initial_policy,
+                room_name,
             } => {
                 self.handle_create_room(
                     conn_id,
@@ -776,6 +936,7 @@ impl RelayState {
                     binding,
                     admin_pubkey_b64,
                     initial_policy,
+                    room_name,
                 )
                 .await;
             }
@@ -791,6 +952,24 @@ impl RelayState {
                     binding,
                     room_id,
                     invite_token,
+                    key_package_b64,
+                    client_join_nonce,
+                )
+                .await;
+            }
+            ClientToRelay::JoinRoomWithCode {
+                room_id,
+                access_secret,
+                key_package_b64,
+                client_join_nonce,
+            } => {
+                self.handle_join_room_with_code(
+                    conn_id,
+                    client_ip,
+                    handle,
+                    binding,
+                    room_id,
+                    access_secret,
                     key_package_b64,
                     client_join_nonce,
                 )
@@ -897,6 +1076,7 @@ impl RelayState {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn handle_create_room(
         &self,
         conn_id: u64,
@@ -905,6 +1085,7 @@ impl RelayState {
         binding: &mut Option<ConnBinding>,
         admin_pubkey_b64: String,
         initial_policy: RoomPolicy,
+        room_name: Option<String>,
     ) {
         if binding.is_some() {
             send_err(
@@ -986,10 +1167,12 @@ impl RelayState {
             );
             return;
         }
+        let sanitized_name = sanitize_room_name(room_name.as_deref());
         rooms.insert(
             room_id.clone(),
             Room {
                 room_id: room_id.clone(),
+                room_name: sanitized_name.clone(),
                 admin_id: admin_id.clone(),
                 admin_pubkey_b64,
                 admin_verifier: verifier,
@@ -1002,6 +1185,7 @@ impl RelayState {
                 commit_log: VecDeque::new(),
                 members,
                 invites: HashMap::new(),
+                active_room_code: None,
                 pending_removals: HashSet::new(),
             },
         );
@@ -1012,17 +1196,20 @@ impl RelayState {
             role: ParticipantRole::Admin,
             is_pending_reservation: false,
             reservation_token_hash: None,
+            reservation_room_code_id: None,
         });
 
         info!(room_id = %room_id, "room created");
         handle.try_send_msg(&RelayToClient::RoomCreated {
             room_id,
+            room_name: sanitized_name,
             participant_id: admin_id,
             resume_token,
             room_created_at_ms: created_at,
             room_expires_at_ms: expires_at,
             policy: initial_policy,
             invite_ttl_secs: self.config.invite_ttl_secs,
+            room_code_ttl_secs: self.config.room_code_ttl_secs,
             keepalive_interval_secs: self.config.keepalive_interval_secs,
         });
     }
@@ -1155,6 +1342,7 @@ impl RelayState {
                         role: ParticipantRole::Guest,
                         is_pending_reservation: true,
                         reservation_token_hash: Some(token_hash.clone()),
+                        reservation_room_code_id: None,
                     });
 
                     follow_up = JoinFollowUp::ForwardToAdmin {
@@ -1235,6 +1423,7 @@ impl RelayState {
                         role: ParticipantRole::Guest,
                         is_pending_reservation: true,
                         reservation_token_hash: Some(token_hash.clone()),
+                        reservation_room_code_id: None,
                     });
 
                     follow_up = JoinFollowUp::ForwardToAdmin {
@@ -1258,6 +1447,7 @@ impl RelayState {
                         role: ParticipantRole::Guest,
                         is_pending_reservation: true,
                         reservation_token_hash: Some(token_hash.clone()),
+                        reservation_room_code_id: None,
                     });
                     if !*forwarded_to_admin {
                         follow_up = JoinFollowUp::ForwardToAdmin {
@@ -1321,11 +1511,13 @@ impl RelayState {
                         role: ParticipantRole::Guest,
                         is_pending_reservation: false,
                         reservation_token_hash: None,
+                        reservation_room_code_id: None,
                     });
                     let room_epoch = room.epoch;
                     let paused = room.messaging_paused();
                     handle.try_send_msg(&RelayToClient::JoinAccepted {
                         room_id,
+                        room_name: room.room_name.clone(),
                         participant_id: cw.guest_id,
                         resume_token: cw.resume_token,
                         commit_id: cw.commit_id,
@@ -1388,6 +1580,319 @@ impl RelayState {
                 handle.try_send_msg(&RelayToClient::JoinPending { room_id, reason });
             }
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_join_room_with_code(
+        &self,
+        conn_id: u64,
+        client_ip: IpAddr,
+        handle: &OutboundHandle,
+        binding: &mut Option<ConnBinding>,
+        room_id: String,
+        access_secret: String,
+        key_package_b64: String,
+        client_join_nonce: String,
+    ) {
+        if binding.is_some() {
+            send_err(handle, "already_bound", "Connection is already bound");
+            return;
+        }
+
+        let now = self.current_time_ms();
+        {
+            let mut limiter = self.ip_limiter.lock().unwrap_or_else(|e| e.into_inner());
+            if limiter.is_room_code_join_rate_limited(
+                client_ip,
+                now,
+                self.config.max_failed_room_code_joins_per_ip_per_min,
+            ) {
+                send_err(
+                    handle,
+                    "rate_limited",
+                    "Too many failed room code attempts. Try again shortly.",
+                );
+                handle.close();
+                return;
+            }
+        }
+
+        let record_fail = || {
+            let mut limiter = self.ip_limiter.lock().unwrap_or_else(|e| e.into_inner());
+            limiter.record_failed_room_code_join(client_ip, now, self.config.max_tracked_ips);
+            send_err(handle, ROOM_CODE_ERROR_CODE, ROOM_CODE_ERROR_MSG);
+        };
+
+        if access_secret.len() < 16 || client_join_nonce.len() < 8 || key_package_b64.is_empty() {
+            record_fail();
+            return;
+        }
+
+        let secret_hash = sha256_hex(access_secret.as_bytes());
+        let mut rooms = self.rooms.lock().await;
+
+        // Join NEVER creates a room.
+        let Some(room) = rooms.get_mut(&room_id) else {
+            record_fail();
+            return;
+        };
+
+        if now >= room.room_expires_at_ms {
+            close_room_locked(&mut rooms, &room_id, "Room lifetime expired".into());
+            record_fail();
+            return;
+        }
+        if room.is_hold_expired(now) {
+            close_room_locked(
+                &mut rooms,
+                &room_id,
+                "Admin reconnect window expired".into(),
+            );
+            record_fail();
+            return;
+        }
+
+        // Verify active room code existence, expiry, and constant-time secret hash BEFORE
+        // revealing any room state (capacity, readiness, etc.).
+        let code_expired = room
+            .active_room_code
+            .as_ref()
+            .is_some_and(|rc| now >= rc.expires_at_ms);
+        if code_expired {
+            room.invalidate_active_room_code();
+            record_fail();
+            return;
+        }
+        let secret_matches = room
+            .active_room_code
+            .as_ref()
+            .is_some_and(|rc| constant_time_eq_str(&rc.secret_hash_hex, &secret_hash));
+        if !secret_matches {
+            record_fail();
+            return;
+        }
+
+        if room.latest_policy_cmd.is_none() {
+            send_err(
+                handle,
+                "room_not_ready",
+                "Room admin has not finished initializing room rules yet",
+            );
+            return;
+        }
+
+        // Prune expired reservations under this room code without extending any deadline.
+        if let Some(rc) = room.active_room_code.as_mut() {
+            rc.reservations.retain(|_, res| {
+                if now >= res.expires_at_ms {
+                    if let Some(gh) = &res.guest_handle {
+                        gh.try_send_msg(&RelayToClient::Error {
+                            code: "join_timeout".into(),
+                            message: "Join reservation expired before admin responded. You can try again while the room code is still valid.".into(),
+                        });
+                        gh.close();
+                    }
+                    false
+                } else {
+                    true
+                }
+            });
+            rc.cached_welcomes.retain(|_, cw| now < cw.expires_at_ms);
+        }
+
+        // 1. Check idempotent retry against an already-open reservation for the same guest nonce+KP.
+        let existing_res_match = room.active_room_code.as_mut().and_then(|rc| {
+            rc.reservations.values_mut().find_map(|res| {
+                if constant_time_eq_str(&res.client_join_nonce, &client_join_nonce)
+                    && constant_time_eq_str(&res.key_package_b64, &key_package_b64)
+                {
+                    if let Some(old_h) = res.guest_handle.replace(handle.clone()) {
+                        old_h.close();
+                    }
+                    res.guest_conn_id = Some(conn_id);
+                    Some((
+                        res.reservation_id.clone(),
+                        res.guest_id.clone(),
+                        res.key_package_b64.clone(),
+                        res.forwarded_to_admin,
+                    ))
+                } else {
+                    None
+                }
+            })
+        });
+
+        if let Some((reservation_id, guest_id, existing_kp, already_forwarded)) = existing_res_match
+        {
+            *binding = Some(ConnBinding {
+                room_id: room_id.clone(),
+                participant_id: guest_id.clone(),
+                role: ParticipantRole::Guest,
+                is_pending_reservation: true,
+                reservation_token_hash: None,
+                reservation_room_code_id: Some(reservation_id.clone()),
+            });
+            if !already_forwarded {
+                let forwarded = room.send_to_admin(&RelayToClient::GuestJoinRequest {
+                    reservation_id: reservation_id.clone(),
+                    guest_id,
+                    key_package_b64: existing_kp,
+                });
+                if let Some(rc) = room.active_room_code.as_mut()
+                    && let Some(res) = rc.reservations.get_mut(&reservation_id)
+                {
+                    res.forwarded_to_admin = forwarded;
+                }
+                let reason = if forwarded {
+                    "Continuing pending admission request".to_string()
+                } else {
+                    "Room admin is temporarily offline; waiting for admin to return".to_string()
+                };
+                handle.try_send_msg(&RelayToClient::JoinPending { room_id, reason });
+            } else {
+                handle.try_send_msg(&RelayToClient::JoinPending {
+                    room_id,
+                    reason: "Continuing pending admission request".into(),
+                });
+            }
+            return;
+        }
+
+        // 2. Check idempotent retry against cached Welcome if JoinAccepted dropped in flight.
+        let cached_welcome = room
+            .active_room_code
+            .as_ref()
+            .and_then(|rc| rc.cached_welcomes.get(&client_join_nonce))
+            .filter(|cw| {
+                now < cw.expires_at_ms
+                    && constant_time_eq_str(&cw.key_package_b64, &key_package_b64)
+                    && room.members.contains_key(&cw.guest_id)
+            })
+            .cloned();
+
+        if let Some(cw) = cached_welcome {
+            let Some(missed_commits) = room.commits_since(cw.welcome_epoch) else {
+                send_err(
+                    handle,
+                    "epoch_desync",
+                    "Room epoch advanced beyond cached welcome; request a new room code",
+                );
+                return;
+            };
+            if let Some(member) = room.members.get_mut(&cw.guest_id) {
+                if let MemberConn::Connected {
+                    handle: old_handle, ..
+                } = &member.conn
+                {
+                    old_handle.close();
+                }
+                member.conn = MemberConn::Connected {
+                    conn_id,
+                    handle: handle.clone(),
+                };
+            }
+            *binding = Some(ConnBinding {
+                room_id: room_id.clone(),
+                participant_id: cw.guest_id.clone(),
+                role: ParticipantRole::Guest,
+                is_pending_reservation: false,
+                reservation_token_hash: None,
+                reservation_room_code_id: None,
+            });
+            let members_snapshot = room.member_summaries();
+            let room_epoch = room.epoch;
+            let paused = room.messaging_paused();
+            handle.try_send_msg(&RelayToClient::JoinAccepted {
+                room_id,
+                room_name: room.room_name.clone(),
+                participant_id: cw.guest_id,
+                resume_token: cw.resume_token,
+                commit_id: cw.commit_id,
+                welcome_epoch: cw.welcome_epoch,
+                epoch: room_epoch,
+                missed_commits,
+                welcome_b64: cw.welcome_b64,
+                admin_pubkey_b64: cw.admin_pubkey_b64,
+                latest_policy_cmd: cw.latest_policy_cmd,
+                room_created_at_ms: cw.room_created_at_ms,
+                room_expires_at_ms: cw.room_expires_at_ms,
+                members: members_snapshot,
+                messaging_paused: paused,
+                keepalive_interval_secs: self.config.keepalive_interval_secs,
+            });
+            return;
+        }
+
+        // 3. Atomically enforce MAX_ROOM_MEMBERS (1 admin + at most 3 guests).
+        if room.total_occupied_slots() >= MAX_ROOM_MEMBERS {
+            send_err(
+                handle,
+                "room_full",
+                "Room already has the maximum of 4 participants",
+            );
+            return;
+        }
+
+        let Ok(reservation_id) = random_token_b64url(12) else {
+            send_err(handle, "internal", "RNG failure");
+            return;
+        };
+        let Ok(guest_id) = random_token_b64url(8) else {
+            send_err(handle, "internal", "RNG failure");
+            return;
+        };
+
+        let code_expires_at_ms = room
+            .active_room_code
+            .as_ref()
+            .map(|rc| rc.expires_at_ms)
+            .unwrap_or(0);
+        let res_expiry = now
+            .saturating_add(self.config.join_reservation_ttl_secs.saturating_mul(1000))
+            .min(code_expires_at_ms)
+            .min(room.room_expires_at_ms);
+
+        if let Some(rc) = room.active_room_code.as_mut() {
+            rc.reservations.insert(
+                reservation_id.clone(),
+                RoomCodeReservation {
+                    reservation_id: reservation_id.clone(),
+                    guest_id: guest_id.clone(),
+                    client_join_nonce,
+                    key_package_b64: key_package_b64.clone(),
+                    guest_conn_id: Some(conn_id),
+                    guest_handle: Some(handle.clone()),
+                    expires_at_ms: res_expiry,
+                    forwarded_to_admin: false,
+                },
+            );
+        }
+
+        *binding = Some(ConnBinding {
+            room_id: room_id.clone(),
+            participant_id: guest_id.clone(),
+            role: ParticipantRole::Guest,
+            is_pending_reservation: true,
+            reservation_token_hash: None,
+            reservation_room_code_id: Some(reservation_id.clone()),
+        });
+
+        let forwarded = room.send_to_admin(&RelayToClient::GuestJoinRequest {
+            reservation_id: reservation_id.clone(),
+            guest_id,
+            key_package_b64,
+        });
+        if let Some(rc) = room.active_room_code.as_mut()
+            && let Some(res) = rc.reservations.get_mut(&reservation_id)
+        {
+            res.forwarded_to_admin = forwarded;
+        }
+        let reason = if forwarded {
+            "Admission request sent to room admin".to_string()
+        } else {
+            "Room admin is temporarily offline; waiting for admin to return".to_string()
+        };
+        handle.try_send_msg(&RelayToClient::JoinPending { room_id, reason });
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1455,23 +1960,42 @@ impl RelayState {
             return;
         };
 
-        // Locate the matching reserved invite AND check its deadlines under the same mutex lock.
-        let matching_token_hash = room.invites.iter().find_map(|(k, inv)| {
-            if let InviteState::Reserved {
-                reservation_id: rid,
-                guest_id: gid,
-                ..
-            } = &inv.state
-                && rid == &reservation_id
-                && gid == &guest_id
-            {
-                Some(k.clone())
-            } else {
-                None
-            }
-        });
+        // Locate the matching reserved invite OR room-code reservation AND check deadlines under the same mutex lock.
+        enum ReservationSource {
+            Invite(String),
+            RoomCode(String),
+        }
 
-        let Some(token_hash) = matching_token_hash else {
+        let source = room
+            .invites
+            .iter()
+            .find_map(|(k, inv)| {
+                if let InviteState::Reserved {
+                    reservation_id: rid,
+                    guest_id: gid,
+                    ..
+                } = &inv.state
+                    && rid == &reservation_id
+                    && gid == &guest_id
+                {
+                    Some(ReservationSource::Invite(k.clone()))
+                } else {
+                    None
+                }
+            })
+            .or_else(|| {
+                room.active_room_code.as_ref().and_then(|rc| {
+                    rc.reservations.get(&reservation_id).and_then(|res| {
+                        if res.guest_id == guest_id {
+                            Some(ReservationSource::RoomCode(reservation_id.clone()))
+                        } else {
+                            None
+                        }
+                    })
+                })
+            });
+
+        let Some(source) = source else {
             send_err(
                 handle,
                 "reservation_not_found",
@@ -1480,54 +2004,96 @@ impl RelayState {
             return;
         };
 
-        // Enforce reservation and invite hard deadlines BEFORE mutating room state.
-        let reservation_expired = {
-            let inv = room.invites.get(&token_hash).unwrap();
-            match &inv.state {
-                InviteState::Reserved { expires_at_ms, .. } => {
-                    now >= *expires_at_ms || now >= inv.expires_at_ms
+        // Enforce reservation and invite/code hard deadlines BEFORE mutating room state.
+        match &source {
+            ReservationSource::Invite(token_hash) => {
+                let reservation_expired = {
+                    let inv = room.invites.get(token_hash).unwrap();
+                    match &inv.state {
+                        InviteState::Reserved { expires_at_ms, .. } => {
+                            now >= *expires_at_ms || now >= inv.expires_at_ms
+                        }
+                        _ => true,
+                    }
+                };
+                if reservation_expired {
+                    let invite_expired = room
+                        .invites
+                        .get(token_hash)
+                        .is_none_or(|inv| now >= inv.expires_at_ms);
+                    if invite_expired {
+                        if let Some(inv) = room.invites.remove(token_hash)
+                            && let InviteState::Reserved {
+                                guest_handle: Some(gh),
+                                ..
+                            } = inv.state
+                        {
+                            gh.try_send_msg(&RelayToClient::Error {
+                                code: "invite_expired".into(),
+                                message: "Invite link has expired".into(),
+                            });
+                            gh.close();
+                        }
+                    } else if let Some(inv) = room.invites.get_mut(token_hash) {
+                        let prev = std::mem::replace(&mut inv.state, InviteState::Unused);
+                        if let InviteState::Reserved {
+                            guest_handle: Some(gh),
+                            ..
+                        } = prev
+                        {
+                            gh.try_send_msg(&RelayToClient::Error {
+                                code: "join_timeout".into(),
+                                message: "Join reservation expired before admin responded. You can try again while the invite link is still valid.".into(),
+                            });
+                            gh.close();
+                        }
+                    }
+                    send_err(
+                        handle,
+                        "reservation_expired",
+                        "Join reservation has already expired",
+                    );
+                    return;
                 }
-                _ => true,
             }
-        };
-        if reservation_expired {
-            let invite_expired = room
-                .invites
-                .get(&token_hash)
-                .is_none_or(|inv| now >= inv.expires_at_ms);
-            if invite_expired {
-                if let Some(inv) = room.invites.remove(&token_hash)
-                    && let InviteState::Reserved {
-                        guest_handle: Some(gh),
-                        ..
-                    } = inv.state
-                {
-                    gh.try_send_msg(&RelayToClient::Error {
-                        code: "invite_expired".into(),
-                        message: "Invite link has expired".into(),
-                    });
-                    gh.close();
+            ReservationSource::RoomCode(res_id) => {
+                let code_expired = room
+                    .active_room_code
+                    .as_ref()
+                    .is_none_or(|rc| now >= rc.expires_at_ms);
+                if code_expired {
+                    room.invalidate_active_room_code();
+                    send_err(
+                        handle,
+                        "reservation_expired",
+                        "Join reservation has already expired",
+                    );
+                    return;
                 }
-            } else if let Some(inv) = room.invites.get_mut(&token_hash) {
-                let prev = std::mem::replace(&mut inv.state, InviteState::Unused);
-                if let InviteState::Reserved {
-                    guest_handle: Some(gh),
-                    ..
-                } = prev
-                {
-                    gh.try_send_msg(&RelayToClient::Error {
-                        code: "join_timeout".into(),
-                        message: "Join reservation expired before admin responded. You can try again while the invite link is still valid.".into(),
-                    });
-                    gh.close();
+                let res_expired = room
+                    .active_room_code
+                    .as_ref()
+                    .and_then(|rc| rc.reservations.get(res_id))
+                    .is_none_or(|res| now >= res.expires_at_ms);
+                if res_expired {
+                    if let Some(rc) = room.active_room_code.as_mut()
+                        && let Some(res) = rc.reservations.remove(res_id)
+                        && let Some(gh) = res.guest_handle
+                    {
+                        gh.try_send_msg(&RelayToClient::Error {
+                            code: "join_timeout".into(),
+                            message: "Join reservation expired before admin responded. You can try again while the room code is still valid.".into(),
+                        });
+                        gh.close();
+                    }
+                    send_err(
+                        handle,
+                        "reservation_expired",
+                        "Join reservation has already expired",
+                    );
+                    return;
                 }
             }
-            send_err(
-                handle,
-                "reservation_expired",
-                "Join reservation has already expired",
-            );
-            return;
         }
 
         let Ok(resume_token) = random_token_b64url(32) else {
@@ -1536,31 +2102,43 @@ impl RelayState {
         };
         let resume_token_hash = sha256_hex(resume_token.as_bytes());
 
-        // Extract reservation info and mark invite Consumed.
-        let (client_join_nonce, key_package_b64, guest_conn_id, guest_handle) = {
-            let inv = room.invites.get_mut(&token_hash).unwrap();
-            let old_state = std::mem::replace(
-                &mut inv.state,
-                InviteState::Consumed {
-                    guest_id: guest_id.clone(),
-                    client_join_nonce: String::new(),
-                    cached_welcome: None,
-                },
-            );
-            match old_state {
-                InviteState::Reserved {
-                    client_join_nonce,
-                    key_package_b64,
-                    guest_conn_id,
-                    guest_handle,
-                    ..
-                } => (
-                    client_join_nonce,
-                    key_package_b64,
-                    guest_conn_id,
-                    guest_handle,
-                ),
-                _ => unreachable!(),
+        // Extract reservation info and consume/remove it.
+        let (client_join_nonce, key_package_b64, guest_conn_id, guest_handle) = match &source {
+            ReservationSource::Invite(token_hash) => {
+                let inv = room.invites.get_mut(token_hash).unwrap();
+                let old_state = std::mem::replace(
+                    &mut inv.state,
+                    InviteState::Consumed {
+                        guest_id: guest_id.clone(),
+                        client_join_nonce: String::new(),
+                        cached_welcome: None,
+                    },
+                );
+                match old_state {
+                    InviteState::Reserved {
+                        client_join_nonce,
+                        key_package_b64,
+                        guest_conn_id,
+                        guest_handle,
+                        ..
+                    } => (
+                        client_join_nonce,
+                        key_package_b64,
+                        guest_conn_id,
+                        guest_handle,
+                    ),
+                    _ => unreachable!(),
+                }
+            }
+            ReservationSource::RoomCode(res_id) => {
+                let rc = room.active_room_code.as_mut().unwrap();
+                let res = rc.reservations.remove(res_id).unwrap();
+                (
+                    res.client_join_nonce,
+                    res.key_package_b64,
+                    res.guest_conn_id,
+                    res.guest_handle,
+                )
             }
         };
 
@@ -1603,26 +2181,36 @@ impl RelayState {
         let paused = room.messaging_paused();
 
         // Store short-lived Welcome cache for idempotent retry if response drops in flight.
-        if let Some(inv) = room.invites.get_mut(&token_hash) {
-            inv.state = InviteState::Consumed {
-                guest_id: guest_id.clone(),
-                client_join_nonce,
-                cached_welcome: Some(CachedJoinAccepted {
-                    guest_id: guest_id.clone(),
-                    resume_token: resume_token.clone(),
-                    key_package_b64,
-                    commit_id: commit_id.clone(),
-                    welcome_epoch: new_epoch,
-                    welcome_b64: welcome_b64.clone(),
-                    admin_pubkey_b64: room.admin_pubkey_b64.clone(),
-                    latest_policy_cmd: latest_policy_cmd.clone(),
-                    room_created_at_ms: room.room_created_at_ms,
-                    room_expires_at_ms: room.room_expires_at_ms,
-                    expires_at_ms: now
-                        .saturating_add(WELCOME_CACHE_WINDOW_MS)
-                        .min(room.room_expires_at_ms),
-                }),
-            };
+        let cached = CachedJoinAccepted {
+            guest_id: guest_id.clone(),
+            resume_token: resume_token.clone(),
+            key_package_b64,
+            commit_id: commit_id.clone(),
+            welcome_epoch: new_epoch,
+            welcome_b64: welcome_b64.clone(),
+            admin_pubkey_b64: room.admin_pubkey_b64.clone(),
+            latest_policy_cmd: latest_policy_cmd.clone(),
+            room_created_at_ms: room.room_created_at_ms,
+            room_expires_at_ms: room.room_expires_at_ms,
+            expires_at_ms: now
+                .saturating_add(WELCOME_CACHE_WINDOW_MS)
+                .min(room.room_expires_at_ms),
+        };
+        match source {
+            ReservationSource::Invite(token_hash) => {
+                if let Some(inv) = room.invites.get_mut(&token_hash) {
+                    inv.state = InviteState::Consumed {
+                        guest_id: guest_id.clone(),
+                        client_join_nonce,
+                        cached_welcome: Some(cached),
+                    };
+                }
+            }
+            ReservationSource::RoomCode(_) => {
+                if let Some(rc) = room.active_room_code.as_mut() {
+                    rc.cached_welcomes.insert(client_join_nonce, cached);
+                }
+            }
         }
 
         // Confirm commit acceptance to Admin so Admin can now apply its staged pending commit locally.
@@ -1657,6 +2245,7 @@ impl RelayState {
         if let Some(gh) = guest_handle {
             gh.try_send_msg(&RelayToClient::JoinAccepted {
                 room_id: room.room_id.clone(),
+                room_name: room.room_name.clone(),
                 participant_id: guest_id,
                 resume_token,
                 commit_id,
@@ -1801,13 +2390,28 @@ impl RelayState {
             role,
             is_pending_reservation: false,
             reservation_token_hash: None,
+            reservation_room_code_id: None,
         });
 
         let members = room.member_summaries();
         let paused = room.messaging_paused();
+        let (room_code_secret_hash_hex, room_code_expires_at_ms) = if role == ParticipantRole::Admin
+        {
+            match room
+                .active_room_code
+                .as_ref()
+                .filter(|rc| now < rc.expires_at_ms)
+            {
+                Some(rc) => (Some(rc.secret_hash_hex.clone()), Some(rc.expires_at_ms)),
+                None => (None, None),
+            }
+        } else {
+            (None, None)
+        };
 
         handle.try_send_msg(&RelayToClient::SessionResumed {
             room_id: room_id.clone(),
+            room_name: room.room_name.clone(),
             participant_id: participant_id.clone(),
             resume_token: new_resume_token,
             conn_generation: conn_id,
@@ -1819,6 +2423,8 @@ impl RelayState {
             members: members.clone(),
             messaging_paused: paused,
             keepalive_interval_secs: self.config.keepalive_interval_secs,
+            room_code_secret_hash_hex,
+            room_code_expires_at_ms,
         });
 
         room.broadcast_members(
@@ -1854,6 +2460,20 @@ impl RelayState {
                         guest_id.clone(),
                         key_package_b64.clone(),
                     ));
+                }
+            }
+            if let Some(rc) = room.active_room_code.as_mut()
+                && now < rc.expires_at_ms
+            {
+                for res in rc.reservations.values_mut() {
+                    if !res.forwarded_to_admin && now < res.expires_at_ms {
+                        res.forwarded_to_admin = true;
+                        pending_joins.push((
+                            res.reservation_id.clone(),
+                            res.guest_id.clone(),
+                            res.key_package_b64.clone(),
+                        ));
+                    }
                 }
             }
             for (reservation_id, guest_id, key_package_b64) in pending_joins {
@@ -1954,6 +2574,10 @@ impl RelayState {
             {
                 *cached_welcome = None;
             }
+        }
+        if let Some(rc) = room.active_room_code.as_mut() {
+            rc.cached_welcomes
+                .retain(|_, cw| cw.guest_id != b.participant_id);
         }
 
         let is_paused = room.messaging_paused();
@@ -2129,6 +2753,16 @@ impl RelayState {
                         _ => {}
                     }
                 }
+                if let Some(rc) = room.active_room_code.as_mut() {
+                    rc.expires_at_ms = rc.expires_at_ms.min(new_expires);
+                    for res in rc.reservations.values_mut() {
+                        res.expires_at_ms = res.expires_at_ms.min(new_expires);
+                    }
+                    for cw in rc.cached_welcomes.values_mut() {
+                        cw.room_expires_at_ms = cw.room_expires_at_ms.min(new_expires);
+                        cw.expires_at_ms = cw.expires_at_ms.min(new_expires);
+                    }
+                }
 
                 room.broadcast_members(
                     &RelayToClient::PolicyUpdated {
@@ -2176,6 +2810,51 @@ impl RelayState {
                     token_hash_hex: token_hash_hex.clone(),
                     expires_at_ms,
                 });
+            }
+            AdminCommandPayload::SetRoomCode {
+                secret_hash_hex,
+                code_ttl_secs,
+            } => {
+                if secret_hash_hex.len() != 64
+                    || !secret_hash_hex.bytes().all(|c| c.is_ascii_hexdigit())
+                {
+                    send_err(
+                        handle,
+                        "invalid_room_code_hash",
+                        "Expected 64-char hex SHA-256 hash",
+                    );
+                    return;
+                }
+                if let Err(e) = room.admin_verifier.commit_seq(signed_cmd.body.seq) {
+                    send_err(handle, "invalid_admin_command", &e.to_string());
+                    return;
+                }
+                // Rotation immediately invalidates any prior code and its open pending reservations.
+                room.invalidate_active_room_code();
+                let effective_ttl = (*code_ttl_secs).min(self.config.room_code_ttl_secs).max(30);
+                let expires_at_ms = now
+                    .saturating_add(effective_ttl.saturating_mul(1000))
+                    .min(room.room_expires_at_ms);
+
+                room.active_room_code = Some(ActiveRoomCode {
+                    secret_hash_hex: secret_hash_hex.clone(),
+                    expires_at_ms,
+                    reservations: HashMap::new(),
+                    cached_welcomes: HashMap::new(),
+                });
+                handle.try_send_msg(&RelayToClient::RoomCodeUpdated {
+                    secret_hash_hex: secret_hash_hex.clone(),
+                    expires_at_ms,
+                });
+            }
+            AdminCommandPayload::RevokeRoomCode => {
+                if let Err(e) = room.admin_verifier.commit_seq(signed_cmd.body.seq) {
+                    send_err(handle, "invalid_admin_command", &e.to_string());
+                    return;
+                }
+                // Revocation invalidates open pending reservations; admitted guests remain in the room.
+                room.invalidate_active_room_code();
+                handle.try_send_msg(&RelayToClient::RoomCodeRevoked);
             }
             AdminCommandPayload::KickGuest { participant_id } => {
                 if participant_id == &room.admin_id {
@@ -2355,6 +3034,10 @@ impl RelayState {
                 *cached_welcome = None;
             }
         }
+        if let Some(rc) = room.active_room_code.as_mut() {
+            rc.cached_welcomes
+                .retain(|_, cw| cw.guest_id != b.participant_id);
+        }
 
         // Forward ONLY to currently connected sockets; NEVER buffer offline messages.
         // Because MlsCommit / JoinAccepted / SessionResumed frames are strictly FIFO-ordered ahead of
@@ -2488,7 +3171,7 @@ impl RelayState {
             return;
         };
 
-        // Explicit cancel of a pending reservation releases the slot back to Unused while the invite is still valid.
+        // Explicit cancel of a pending reservation releases the slot immediately.
         if !room.members.contains_key(&b.participant_id) {
             if let Some(hash) = b.reservation_token_hash
                 && let Some(inv) = room.invites.get_mut(&hash)
@@ -2499,6 +3182,17 @@ impl RelayState {
                 } else {
                     room.invites.remove(&hash);
                 }
+                if room.connected_socket_count() == 0 && !room.should_hold_empty(now) {
+                    rooms.remove(&b.room_id);
+                }
+            } else if let Some(res_id) = b.reservation_room_code_id
+                && let Some(rc) = room.active_room_code.as_mut()
+                && rc
+                    .reservations
+                    .get(&res_id)
+                    .is_some_and(|r| r.guest_conn_id == Some(conn_id))
+            {
+                rc.reservations.remove(&res_id);
                 if room.connected_socket_count() == 0 && !room.should_hold_empty(now) {
                     rooms.remove(&b.room_id);
                 }
@@ -2553,7 +3247,7 @@ impl RelayState {
             return;
         };
 
-        // Pending reservation disconnect: DO NOT discard the reservation or invite!
+        // Pending reservation disconnect: DO NOT discard the reservation or invite/code!
         // Keep the reservation alive until its fixed expiry so the browser can retry with the same nonce.
         // Never extend any room hold or admin resume deadline on guest disconnect.
         if !room.members.contains_key(&b.participant_id) {
@@ -2568,6 +3262,16 @@ impl RelayState {
             {
                 *guest_conn_id = None;
                 *guest_handle = None;
+                if room.connected_socket_count() == 0 && !room.should_hold_empty(now) {
+                    rooms.remove(&b.room_id);
+                }
+            } else if let Some(ref res_id) = b.reservation_room_code_id
+                && let Some(rc) = room.active_room_code.as_mut()
+                && let Some(res) = rc.reservations.get_mut(res_id)
+                && res.guest_conn_id == Some(conn_id)
+            {
+                res.guest_conn_id = None;
+                res.guest_handle = None;
                 if room.connected_socket_count() == 0 && !room.should_hold_empty(now) {
                     rooms.remove(&b.room_id);
                 }
@@ -2597,8 +3301,8 @@ impl RelayState {
             return;
         }
 
-        // If Admin disconnected with any uncompleted Reserved invites, allow them to be
-        // re-forwarded upon verified Admin resume (in case the previous socket was half-open).
+        // If Admin disconnected with any uncompleted Reserved invites or room-code reservations,
+        // allow them to be re-forwarded upon verified Admin resume (in case the previous socket was half-open).
         if b.role == ParticipantRole::Admin {
             for inv in room.invites.values_mut() {
                 if let InviteState::Reserved {
@@ -2606,6 +3310,11 @@ impl RelayState {
                 } = &mut inv.state
                 {
                     *forwarded_to_admin = false;
+                }
+            }
+            if let Some(rc) = room.active_room_code.as_mut() {
+                for res in rc.reservations.values_mut() {
+                    res.forwarded_to_admin = false;
                 }
             }
         }

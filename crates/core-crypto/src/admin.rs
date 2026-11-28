@@ -190,6 +190,11 @@ pub enum AdminCommandPayload {
         token_hash_hex: String,
         invite_ttl_secs: u64,
     },
+    SetRoomCode {
+        secret_hash_hex: String,
+        code_ttl_secs: u64,
+    },
+    RevokeRoomCode,
     KickGuest {
         participant_id: String,
     },

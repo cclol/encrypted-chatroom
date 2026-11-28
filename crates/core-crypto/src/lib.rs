@@ -5,6 +5,7 @@ pub mod mls;
 pub mod padding;
 pub mod policy;
 pub mod protocol;
+pub mod room_code;
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
